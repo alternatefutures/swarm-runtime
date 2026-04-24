@@ -1,0 +1,97 @@
+// crates/af-swarm-state/proto/conversation.proto
+// Conversation turn records — per-turn storage for agent conversation history.
+//
+// Key format: {tenant_id}||{agent_id}||conv||{turn_id}
+// where turn_id is a ULID (time-ordered, lexicographically sortable).
+//
+// Design: docs/architecture/design/state-schema.md §3.5
+// Issue: alternatefutures/admin#134
+//
+// Size budget: ≤32 KB per turn.
+// TTL: 30 days default (configurable per-tenant for compliance, state-schema.md §9.3).
+
+syntax = "proto3";
+
+package af.swarm.state;
+
+import "google/protobuf/timestamp.proto";
+import "common.proto";
+import "encryption.proto";
+
+option go_package = "github.com/alternatefutures/swarm/state;state";
+
+// ────────────────────────────────────────────────────────────────────────────
+// ConversationTurnRecord
+// ────────────────────────────────────────────────────────────────────────────
+message ConversationTurnRecord {
+  // ── Identity ──────────────────────────────────────────────────────────────
+  string tenant_id = 1;
+  string agent_id = 2;
+  // ULID — lexicographically sortable, provides time-ordered iteration without
+  // a secondary timestamp index. Iteration: scan keys matching
+  // {tenant}||{agent}||conv||* and sort lexicographically descending.
+  string turn_id = 3;
+
+  // ── Content ───────────────────────────────────────────────────────────────
+  // Message role: "user", "assistant", or "tool_result"
+  string role = 4;
+  // Serialized MessageContent — see MessageContent below.
+  // Encrypted per encryption field when sensitivity >= SENSITIVE.
+  bytes content = 5;
+
+  // ── Token accounting ──────────────────────────────────────────────────────
+  uint64 input_tokens = 6;
+  uint64 output_tokens = 7;
+  // Model used for this turn (e.g. "kimi-k2.5", "claude-sonnet-4-6")
+  string model_id = 8;
+
+  // ── DSE taint ─────────────────────────────────────────────────────────────
+  // Serialized TaintContext proto capturing the DSE state at this turn.
+  // Stored for audit trail and to reconstruct taint on SYNAPSE retrieval.
+  bytes taint_context = 9;
+
+  // ── Tool calls in this turn ───────────────────────────────────────────────
+  // ToolCallLogRecord keys for tool invocations made during this turn.
+  // Lazy-loaded; not included in the turn record itself to stay within size budget.
+  repeated string tool_log_ids = 10;
+
+  google.protobuf.Timestamp created_at = 11;
+
+  // ── Encryption ────────────────────────────────────────────────────────────
+  EncryptionEnvelope encryption = 12;
+
+  uint32 schema_version = 13;
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// MessageContent
+// (serialized into ConversationTurnRecord.content)
+// ────────────────────────────────────────────────────────────────────────────
+// Represents the content of a single conversation turn, which may be plain
+// text, a tool use request, or a tool result.
+message MessageContent {
+  oneof kind {
+    TextContent text = 1;
+    ToolUseContent tool_use = 2;
+    ToolResultContent tool_result = 3;
+  }
+}
+
+message TextContent {
+  string text = 1;  // Max 32KB
+}
+
+message ToolUseContent {
+  string tool_use_id = 1;  // matches tool call log entry
+  string tool_name = 2;
+  // JSON-encoded tool input (sanitized — secrets redacted before storage)
+  string input_json = 3;
+}
+
+message ToolResultContent {
+  string tool_use_id = 1;  // matches the tool_use_id that triggered this result
+  string tool_name = 2;
+  // JSON-encoded tool output (sanitized — secrets redacted before storage)
+  string output_json = 3;
+  bool is_error = 4;
+}

@@ -1,0 +1,29 @@
+# buf.yaml — buf build configuration for af-swarm proto files.
+# https://buf.build/docs/configuration/v1/buf-yaml
+#
+# Usage:
+#   buf build                    # validate all .proto files
+#   buf generate                 # generate Rust code (requires buf.gen.yaml)
+#   buf lint                     # lint for style conformance
+#   buf breaking --against .git  # check for breaking changes vs. last commit
+#
+# Integration contract: docs/architecture/design/integration-contract.md §4.2
+
+version: v1
+
+name: buf.build/alternatefutures/af-swarm
+
+deps:
+  - buf.build/googleapis/googleapis  # google/protobuf/timestamp.proto, empty.proto, etc.
+
+lint:
+  use:
+    - DEFAULT
+  except:
+    - PACKAGE_VERSION_SUFFIX  # We use af.swarm.v1 without buf-managed versioning
+  ignore_only:
+    FIELD_LOWER_SNAKE_CASE: []  # Allow existing Dapr-style field names
+
+breaking:
+  use:
+    - FILE

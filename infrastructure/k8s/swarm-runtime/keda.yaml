@@ -1,0 +1,99 @@
+# KEDA ScaledObject for Swarm Runtime
+# Issue: alternatefutures/admin#130
+# Track: Infrastructure — Dapr deployment substrate
+#
+# Scale-to-zero policy: dapr-deployment.md §6
+# Triggers on NATS JetStream consumer lag.
+#
+# Cold-start budget analysis (dapr-deployment.md §6.2):
+#   - Warm pod actor hydration: <5ms (meets RFC-001 OQ-5 P99 <500ms SLO)
+#   - Cold pod from zero (Akash Tier C): ~30s (does NOT meet 500ms SLO)
+#   - Recommendation: minReplicaCount: 1 for orchestrator, 0 for batch workers
+#
+# OQ-I4: Confirm minReplicaCount for orchestrator pod in production (human decision needed)
+
+---
+# Batch worker pods (marketing swarm, classification) — true scale-to-zero
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: swarm-runtime-batch-scaler
+  namespace: swarm-runtime
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: swarm-runtime-batch
+  minReplicaCount: 0
+  maxReplicaCount: 8       # 8 pods × 100 actors = 800 batch agents
+  cooldownPeriod: 300      # 5 min idle before scale to 0
+  pollingInterval: 15      # Check lag every 15s
+  triggers:
+    - type: nats-jetstream
+      metadata:
+        natsServerMonitoringEndpoint: "44.223.242.234:8222"
+        account: "$G"
+        stream: "SWARM"
+        consumer: "swarm-batch-workers"
+        lagThreshold: "50"
+        activationLagThreshold: "1"
+
+---
+# Orchestrator + code swarm pods — keep-warm (minReplicaCount: 1)
+# OQ-I4: Change to 0 if cold-start SLO is relaxed
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: swarm-runtime-core-scaler
+  namespace: swarm-runtime
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: swarm-runtime
+  minReplicaCount: 1       # Keep at least 1 warm — see OQ-I4
+  maxReplicaCount: 10
+  cooldownPeriod: 600      # 10 min cooldown for core pods
+  pollingInterval: 10
+  triggers:
+    - type: nats-jetstream
+      metadata:
+        natsServerMonitoringEndpoint: "44.223.242.234:8222"
+        account: "$G"
+        stream: "SWARM"
+        consumer: "swarm-actor-events"
+        lagThreshold: "100"
+        activationLagThreshold: "1"
+
+---
+# HorizontalPodAutoscaler as fallback for non-KEDA clusters
+# Only one of KEDA ScaledObject or HPA should be active at a time
+# KEDA takes precedence when installed
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: swarm-runtime-hpa-fallback
+  namespace: swarm-runtime
+  annotations:
+    # Disable this HPA when KEDA is installed
+    af/keda-preferred: "true"
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: swarm-runtime
+  minReplicas: 1
+  maxReplicas: 10
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: 80

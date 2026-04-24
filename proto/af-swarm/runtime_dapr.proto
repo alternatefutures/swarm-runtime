@@ -1,0 +1,234 @@
+// proto/af-swarm/runtime_dapr.proto
+//
+// Contract between the AF Swarm Runtime (Rust) and the Dapr sidecar.
+//
+// DIRECTION NOTE:
+//   - Rust runtime → Dapr sidecar: via dapr Rust SDK (gRPC, port 50001 by default)
+//   - Dapr sidecar → Rust runtime: via actor host HTTP endpoint (see §3.1 of
+//     integration-contract.md and CL-001). The DaprActorHostService below
+//     documents the HTTP contract the Rust runtime MUST implement.
+//
+// The Dapr sidecar uses its own proto API (dapr/proto/runtime/v1/).
+// This file wraps our domain-specific layer on top of that API.
+// See: https://docs.dapr.io/reference/api/actors_api/
+//
+// Integration contract: docs/architecture/design/integration-contract.md §3.1
+
+syntax = "proto3";
+
+package af.swarm.v1;
+
+option java_package = "ai.alternatefutures.swarm.v1";
+option go_package = "github.com/alternatefutures/swarm/v1";
+
+import "google/protobuf/empty.proto";
+import "google/protobuf/timestamp.proto";
+import "proto/af-swarm/common.proto";
+
+// ---------------------------------------------------------------------------
+// Actor host service (Rust runtime exposes; Dapr sidecar calls in)
+// See CL-001 resolution: use dapr Rust SDK actor host abstraction.
+// This service documents the contract the SDK implements on our behalf.
+// The Rust runtime does NOT need to implement this manually —
+// DaprActivationListenerActor delegates to the SDK.
+//
+// Dapr actor type: "SwarmAgent"
+// HTTP path format: PUT /actors/SwarmAgent/{agent_id}/method/{method_name}
+// ---------------------------------------------------------------------------
+service DaprActorHostService {
+  // Called by Dapr when an agent is activated (hydrated from state store).
+  // Rust runtime implementation: SwarmSupervisor.send(HydrateRequest { agent_id })
+  // TODO: implementation in Phase 1 — implemented by dapr Rust SDK; not hand-rolled
+  rpc OnActivate(ActorActivateRequest) returns (google.protobuf.Empty);
+
+  // Called by Dapr to deliver a message to an active agent.
+  // Method names correspond to AgentMessage variant names.
+  // e.g. method_name = "Task", payload = serialized TaskDispatch
+  // Rust runtime: L1RouterActor.route(agent_id, AgentMessage) via Flume
+  // TODO: implementation in Phase 1
+  rpc OnInvoke(ActorInvokeRequest) returns (ActorInvokeResponse);
+
+  // Called by Dapr when idle TTL expires (AGENT_IDLE_TTL_SECS = 300).
+  // Rust runtime: AgentActor.send(LifecycleCommand::Drain), then Freeze.
+  // TODO: implementation in Phase 1
+  rpc OnDeactivate(ActorDeactivateRequest) returns (google.protobuf.Empty);
+
+  // Called by Dapr to get actor configuration.
+  // Rust runtime: returns static ActorConfig.
+  // TODO: implementation in Phase 0
+  rpc GetConfig(google.protobuf.Empty) returns (DaprActorConfig);
+
+  // Health check. Returns 200/OK when runtime is ready for activations.
+  // TODO: implementation in Phase 0
+  rpc Healthz(google.protobuf.Empty) returns (HealthzResponse);
+}
+
+message ActorActivateRequest {
+  // Actor type. Always "SwarmAgent" in Phase 1.
+  string actor_type = 1;
+  // Actor ID. Corresponds to AgentId.value.
+  string actor_id = 2;
+  TraceContext trace_context = 3;
+}
+
+message ActorInvokeRequest {
+  string actor_type = 1;
+  string actor_id = 2;
+  // Method name. Corresponds to AgentMessage enum variant: "Task", "DirectMessage",
+  // "LifecycleCommand", "Ping". See rust-runtime-internals.md §6.1.
+  string method_name = 3;
+  // Base64-encoded prost-serialized payload. Type depends on method_name.
+  bytes data = 4;
+  TraceContext trace_context = 5;
+}
+
+message ActorInvokeResponse {
+  // Base64-encoded prost-serialized response. May be empty for fire-and-forget.
+  bytes data = 1;
+}
+
+message ActorDeactivateRequest {
+  string actor_type = 1;
+  string actor_id = 2;
+  TraceContext trace_context = 3;
+}
+
+message DaprActorConfig {
+  // Actor types registered in this runtime.
+  repeated DaprActorTypeConfig actor_types = 1;
+}
+
+message DaprActorTypeConfig {
+  string actor_type = 1;
+  // ISO 8601 duration string. e.g. "5m" for AGENT_IDLE_TTL_SECS=300.
+  string actor_idle_timeout = 2;
+  // ISO 8601 duration string. How often Dapr scans for idle actors.
+  string actor_scan_interval = 3;
+  // ISO 8601 duration string. Drain timeout before forced deactivation.
+  string drain_ongoing_call_timeout = 4;
+  bool drain_rebalanced_actors = 5;
+}
+
+message HealthzResponse {
+  bool ready = 1;
+  string version = 2;
+  uint32 active_agent_count = 3;
+}
+
+// ---------------------------------------------------------------------------
+// State store operations
+// The Rust runtime calls Dapr state store via SDK. These messages
+// document the logical contract for AgentSnapshot persistence.
+// See CL-003: Dapr state store uses JSON encoding (not prost).
+// See CL-001: RESTRICTED-tier agent state is FHE-encrypted before write.
+// ---------------------------------------------------------------------------
+
+// Logical read request. SDK translates to Dapr state API.
+// Key format: "agent:{agent_id}:snapshot"
+message DaprStateReadRequest {
+  AgentId agent_id = 1;
+  TenantId tenant_id = 2;
+  // Component name. "state-open" for PUBLIC/INTERNAL/SENSITIVE agents;
+  // "state-restricted" for RESTRICTED agents.
+  // See Argus #138 §6.2 for component scoping rules.
+  string component_name = 3;
+  TraceContext trace_context = 4;
+}
+
+// DaprStateClient MUST verify snapshot.integrity_hmac before returning to caller.
+// HMAC mismatch => AF-099 error + agent quarantine. See integration-contract.md §4.6
+// (Integrity Layer). FM-class for HMAC mismatch: FM-HMAC-001 (placeholder — Quinn to
+// assign canonical number in PR #143).
+message DaprStateReadResponse {
+  AgentSnapshot snapshot = 1;
+  // ETag from Dapr. Must be passed back on write for optimistic concurrency.
+  // FM-21: ETag mismatch on write triggers re-read + merge + retry (max 3).
+  string etag = 2;
+  bool found = 3;
+}
+
+// Logical write request. RESTRICTED agents: snapshot.working_memory is
+// FHE-encrypted before this call (Argus #138 §6.1).
+message DaprStateWriteRequest {
+  AgentSnapshot snapshot = 1;
+  string component_name = 2;
+  // ETag for optimistic concurrency. Received from previous DaprStateReadResponse.
+  string etag = 3;
+  TraceContext trace_context = 4;
+}
+
+message DaprStateWriteResponse {
+  bool success = 1;
+  // Set if ETag mismatch (FM-21). Caller should re-read and retry.
+  bool etag_mismatch = 2;
+  string new_etag = 3;
+}
+
+// ---------------------------------------------------------------------------
+// Pub/sub bindings (L3 NATS via Dapr pub/sub)
+// v3.0 §3.2: NATS remains the wire protocol; Dapr pub/sub wraps it at inter-node.
+// RESTRICTED agents: payloads are FHE-encrypted before publish (Argus #138 §7.3).
+// ---------------------------------------------------------------------------
+
+// Topics defined for af-swarm (INT-002 RESOLVED):
+//
+// JetStream (durable, exactly-once via ack + dedup):
+//   - af.swarm.tasks         : Task dispatch (orchestrator → agent, cross-machine)
+//   - af.swarm.results       : Task results (agent → orchestrator, cross-machine)
+//   - af.swarm.audit         : Audit log events (SEC-001 through SEC-012, Argus §8.1)
+//   - af.swarm.lifecycle     : Agent lifecycle events (hydrated, frozen, quarantined)
+//
+// Core NATS (fire-and-forget, loss acceptable):
+//   - af.swarm.backpressure  : Advisory backpressure signals (runtime → orchestrator)
+//   - af.swarm.broadcast     : L2 broadcast events (advisory only)
+//
+// Rationale: Core NATS broker restart loses in-flight tasks — unacceptable given
+// PR #143 integrity model. JetStream cost accepted.
+// See integration-contract.md §3.1 (INT-002 resolution).
+
+message NatsEnvelope {
+  // NATS subject (e.g. "af.swarm.tasks")
+  string subject = 1;
+  // Topic-specific message. Serialized prost message bytes.
+  // For RESTRICTED agents: outer envelope is plaintext; `payload` is FHE-ciphertext.
+  bytes payload = 2;
+  // Schema type name for deserializing `payload`. e.g. "af.swarm.v1.TaskDispatchEvent"
+  string payload_type = 3;
+  TraceContext trace_context = 4;
+  google.protobuf.Timestamp published_at = 5;
+  // Publishing node ID.
+  string source_node_id = 6;
+}
+
+// Published when an agent is successfully hydrated and Active.
+message AgentHydratedEvent {
+  AgentId agent_id = 1;
+  TenantId tenant_id = 2;
+  google.protobuf.Timestamp hydrated_at = 3;
+  // Duration of hydration (Dapr state read + ractor spawn + ready signal).
+  // Target: P99 < 10s (integration-contract.md §4.4).
+  uint64 hydration_duration_ms = 4;
+  string node_id = 5;
+}
+
+// Published when an agent is successfully frozen.
+message AgentFrozenEvent {
+  AgentId agent_id = 1;
+  TenantId tenant_id = 2;
+  google.protobuf.Timestamp frozen_at = 3;
+  uint64 freeze_duration_ms = 4;
+  string node_id = 5;
+}
+
+// Published when an agent is quarantined (restart budget exhausted).
+// Triggers OrchestratorActor to reroute pending tasks.
+message AgentQuarantinedEvent {
+  AgentId agent_id = 1;
+  TenantId tenant_id = 2;
+  google.protobuf.Timestamp quarantined_at = 3;
+  string reason = 4;
+  // FM class. e.g. "FM-22" for hydration deserialization failure.
+  string fault_mode = 5;
+  // Pending task IDs that need rerouting.
+  repeated TaskId pending_task_ids = 6;
+}

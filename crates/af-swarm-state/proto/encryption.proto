@@ -1,0 +1,94 @@
+// crates/af-swarm-state/proto/encryption.proto
+// Encryption envelope for at-rest protection of state records.
+// Design: docs/architecture/design/state-schema.md §8
+// Issue: alternatefutures/admin#134
+//
+// Coordination: argus (#133) owns key derivation hierarchy and key storage.
+// This file defines the envelope structure; key lookup is via the KeyProvider
+// trait in crates/af-swarm-state/src/encryption.rs.
+
+syntax = "proto3";
+
+package af.swarm.state;
+
+import "common.proto";
+
+option go_package = "github.com/alternatefutures/swarm/state;state";
+
+// ────────────────────────────────────────────────────────────────────────────
+// EncryptionEnvelope
+//
+// Embedded in each state record when sensitivity >= SENSITIVE.
+// The outer record retains plaintext fields required for key lookup:
+//   - tenant_id, agent_id (for key resolution)
+//   - encryption.scheme, encryption.key_id (for decryption dispatch)
+//
+// The ciphertext field contains the encrypted serialization of the
+// "inner" record proto. Decryption happens in the agent process on
+// Tier A hardware (v3.0 §5.6.4, RFC-001 §4.4).
+// ────────────────────────────────────────────────────────────────────────────
+message EncryptionEnvelope {
+  // Which encryption scheme was applied.
+  EncryptionScheme scheme = 1;
+
+  // Opaque key identifier resolved via KeyProvider.
+  // For AES_256_GCM: Infisical secret path or KMS key ID.
+  // For FHE_TFHE_RS: tenant FHE key ID managed by argus (#133).
+  string key_id = 2;
+
+  // Initialization vector or nonce.
+  // AES-256-GCM: 12 bytes (96 bits) randomly generated per write.
+  // FHE_TFHE_RS: 16 bytes nonce if applicable to the TFHE-rs scheme in use.
+  bytes iv_or_nonce = 3;
+
+  // Encrypted serialization of the wrapped inner proto message.
+  // AES-256-GCM: GCM ciphertext + 16-byte authentication tag appended.
+  // FHE_TFHE_RS: TFHE-rs serialized ciphertext (size varies by plaintext length).
+  bytes ciphertext = 4;
+
+  // Additional Authenticated Data (AAD) for AES-256-GCM.
+  // Authenticated but NOT encrypted. Binds the ciphertext to the specific
+  // record identity so a ciphertext cannot be replayed under a different key.
+  // Value: protobuf encoding of AadBinding (below).
+  // For FHE_TFHE_RS: not used (FHE does not support AAD natively).
+  bytes aad = 5;
+}
+
+// Authenticated binding included in AES-256-GCM AAD.
+// Prevents ciphertext from being moved to a different tenant/agent/key
+// without detection.
+message AadBinding {
+  string tenant_id = 1;
+  string agent_id = 2;
+  uint32 schema_version = 3;  // prevents ciphertext from being used after schema migration
+  string record_type = 4;     // "agent_state", "working_memory", "checkpoint", etc.
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// KeyRotationMetadata
+//
+// Written alongside state records during key rotation.
+// The rotation job reads old ciphertext, decrypts with old_key_id,
+// re-encrypts with new_key_id, and writes back. This message tracks
+// rotation progress for observability and resumability.
+// ────────────────────────────────────────────────────────────────────────────
+message KeyRotationMetadata {
+  string tenant_id = 1;
+  string old_key_id = 2;
+  string new_key_id = 3;
+  EncryptionScheme scheme = 4;
+
+  // Rotation state counters (for monitoring and resumable rotation)
+  uint64 records_pending = 5;
+  uint64 records_rotated = 6;
+  uint64 records_failed = 7;
+
+  google.protobuf.Timestamp rotation_started_at = 8;
+  google.protobuf.Timestamp rotation_completed_at = 9;  // zero if in progress
+}
+
+// NOTE: Importing google.protobuf.Timestamp requires the protobuf well-known types.
+// Add to build.rs:
+//   prost_build::Config::new()
+//     .compile_well_known_types()
+//     .compile_protos(&["proto/..."], &["proto/"])?;

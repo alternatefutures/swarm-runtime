@@ -1,0 +1,277 @@
+# Akash SDL — Swarm Runtime (OPEN POOL, Tier C) — EXECUTION TIER ONLY
+# Issue: alternatefutures/admin#130
+# Track: Infrastructure — Dapr deployment substrate
+# Rework: PR #140 — Redis removed; SDL scoped to execution pods only per §10 substrate migration
+#
+# SCOPE: This SDL deploys EXECUTION-TIER workloads only on Akash Tier C providers.
+#
+#   ✅ ON AKASH:   swarm-runtime (Rust binary + Turso L1 embedded), dapr-sidecar
+#   ❌ NOT AKASH:  SurrealDB L2 cluster (AWS Phase A → AF bare-metal Phase B, per §10)
+#   ❌ NOT AKASH:  NATS JetStream server (stable tier — EC2 Phase A → AF bare-metal Phase B)
+#   ❌ NOT AKASH:  Dapr placement service (stable tier — co-located with NATS/SurrealDB)
+#   ❌ REMOVED:    Redis (superseded by Turso L1 embedded libSQL, OQ-9 resolution #144)
+#
+# Turso L1 storage: per-pod PVC at /data/turso/actor.db (no separate service needed).
+# SurrealDB L2 URL injected at runtime via AF_SWARM_L2_URL env var (Infisical secret).
+#
+# Confirmed providers (from MEMORY.md):
+#   - Zanthem: akash1vg3gk6dynh9ys45tzjyedp0dl52s93kap75x3n (GPU-capable, staging DSEQ 25465123)
+#   - Subangle: DSEQ 24756776 (standard compute, auth service host)
+#   - Europlots: DSEQ 24672527 (standard compute, secrets service host)
+#
+# Data sensitivity: PUBLIC / INTERNAL / SENSITIVE only
+# RESTRICTED workloads: see swarm-runtime-restricted.sdl (Tier A, separate SDL)
+#
+# Platform requirement: linux/amd64 only (Akash providers are x86-64)
+# Build: docker build --platform linux/amd64 ...
+#
+# Akash SDL v2.0 spec
+
+version: "2.0"
+
+services:
+  # ─────────────────────────────────────────────────────────────────────────────
+  # swarm-runtime: Rust binary + Dapr sidecar (injected via annotations in K8s;
+  # on Akash without K8s orchestration, dapr is run as a companion process in
+  # the same container via supervisord OR as a separate service sharing a network)
+  #
+  # Akash does not support K8s pod-level sidecar injection natively.
+  # Two approaches:
+  #   Option A: Bundle daprd in the same container image alongside the Rust binary,
+  #             started via supervisord/s6-overlay
+  #   Option B: Separate services in same SDL "group" sharing a network namespace
+  #
+  # Recommendation: Option B (separate services, same group) — keeps images lean
+  # and allows independent daprd upgrades. Services share a private network within
+  # the group; runtime calls daprd at localhost:3500.
+  #
+  # TODO: Validate Option B network sharing with Akash provider before production.
+  # ─────────────────────────────────────────────────────────────────────────────
+
+  swarm-runtime:
+    image: 219282777226.dkr.ecr.us-east-1.amazonaws.com/swarm-runtime:latest
+    # TODO: Replace with public registry or Akash-accessible private registry
+    # ECR requires IAM credentials — consider Docker Hub or GHCR for Akash deployments
+    expose:
+      - port: 8080
+        as: 80
+        proto: tcp
+        to:
+          - service: dapr-sidecar  # Internal: runtime calls daprd
+          - global: true           # External: A2A gateway + API
+      - port: 50051
+        as: 50051
+        proto: tcp
+        to:
+          - service: dapr-sidecar  # gRPC for Dapr actor reminders
+      - port: 8081
+        as: 8081
+        proto: tcp
+        to:
+          - global: false           # Prometheus metrics — internal only
+    env:
+      - RUST_LOG=info,swarm_runtime=debug
+      - DAPR_HTTP_PORT=3500
+      - DAPR_GRPC_PORT=50001
+      - AF_SWARM_L1_DB_PATH=/data/turso/actor.db      # Turso L1 embedded SQLite path (OQ-9 #144)
+      - AF_SWARM_PUBSUB_JS=pubsub-nats-js             # JetStream component (durable topics)
+      - AF_SWARM_PUBSUB_CORE=pubsub-nats-core         # Core NATS component (advisory topics)
+      - AF_SWARM_DATA_TIER=open-pool
+      # TODO: Inject secrets via Infisical sidecar or Akash env secrets
+      # NATS_URL, AF_SWARM_L2_URL (SurrealDB connection string)
+      # see: https://docs.akash.network/docs/network-features/deployment-manifest#secret-env-vars
+    params:
+      storage:
+        data:
+          mount: /data
+          readOnly: false
+
+  dapr-sidecar:
+    # Dapr runtime (daprd) — companion service in same placement group
+    # Shares network with swarm-runtime; exposes localhost:3500 and localhost:50001
+    image: daprio/daprd:1.13.0
+    command:
+      - "/daprd"
+    args:
+      - "--app-id=swarm-runtime"
+      - "--app-port=8080"
+      - "--dapr-http-port=3500"
+      - "--dapr-grpc-port=50001"
+      - "--metrics-port=9090"
+      - "--log-level=info"
+      - "--components-path=/components"
+      - "--config=/config/swarm-runtime-config.yaml"
+      # Actor config (dapr-deployment.md §2.4)
+      - "--actor-idle-timeout=5m"
+      - "--actor-scan-interval=30s"
+    expose:
+      - port: 3500
+        as: 3500
+        proto: tcp
+        to:
+          - service: swarm-runtime   # Only accessible to sibling service
+      - port: 50001
+        as: 50001
+        proto: tcp
+        to:
+          - service: swarm-runtime
+      - port: 9090
+        as: 9090
+        proto: tcp
+        to:
+          - global: false            # Prometheus metrics — internal
+    params:
+      storage:
+        config:
+          mount: /config
+          readOnly: true
+        components:
+          mount: /components
+          readOnly: true
+
+  # Redis service REMOVED — superseded by Turso L1 embedded libSQL (OQ-9 resolution #144).
+  # OQ-I5 (Redis Sentinel vs Cluster) is CLOSED — no longer applicable.
+  # Turso L1 is embedded in the swarm-runtime container via PVC at /data/turso/actor.db.
+  # SurrealDB L2 runs on stable tier (AWS Phase A → AF bare-metal Phase B) — not on Akash.
+  # See dapr-deployment.md §10 for substrate migration plan.
+
+profiles:
+  compute:
+    swarm-runtime:
+      resources:
+        cpu:
+          units: 2.0
+        memory:
+          size: 2Gi
+        storage:
+          - name: data
+            size: 10Gi
+            attributes:
+              persistent: true
+              class: beta3       # SSD storage class on Akash
+
+    dapr-sidecar:
+      resources:
+        cpu:
+          units: 0.2             # dapr-deployment.md §2.2: 200m CPU limit
+        memory:
+          size: 256Mi            # dapr-deployment.md §2.2: 256Mi memory limit
+        storage:
+          - name: config
+            size: 100Mi
+            attributes:
+              persistent: false
+          - name: components
+            size: 100Mi
+            attributes:
+              persistent: false
+
+  # redis compute profile REMOVED — see service comment above.
+
+  placement:
+    # ─────────────────────────────────────────────────────────────────────────
+    # Placement: Zanthem (primary — GPU-capable, staging-proven)
+    # Provider: akash1vg3gk6dynh9ys45tzjyedp0dl52s93kap75x3n
+    # Notes:
+    #   - Current staging DSEQ 25465123 runs here
+    #   - GPU capability useful for future Kimi K2.5 inference (RFC-001 §1.3)
+    #   - DO NOT route RESTRICTED workloads here (Tier C, unaudited DePIN)
+    # ─────────────────────────────────────────────────────────────────────────
+    zanthem-primary:
+      attributes:
+        host: akash
+        tier: community
+        region: us-east
+      signedBy:
+        anyOf:
+          - akash1vg3gk6dynh9ys45tzjyedp0dl52s93kap75x3n  # Zanthem
+      pricing:
+        swarm-runtime:
+          denom: uakt
+          amount: 2000           # ~$0.06/hr at current AKT price — tune based on load test
+        dapr-sidecar:
+          denom: uakt
+          amount: 200
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Placement: Subangle (secondary — standard compute)
+    # Provider: confirmed from MEMORY.md (auth service, DSEQ 24756776)
+    # Use for overflow capacity when Zanthem is at capacity
+    # ─────────────────────────────────────────────────────────────────────────
+    subangle-secondary:
+      attributes:
+        host: akash
+        tier: community
+      signedBy:
+        anyOf:
+          # TODO: Add Subangle provider address (confirm from `akash provider list`)
+          - PLACEHOLDER_SUBANGLE_PROVIDER_ADDRESS
+      pricing:
+        swarm-runtime:
+          denom: uakt
+          amount: 1800
+        dapr-sidecar:
+          denom: uakt
+          amount: 180
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Placement: Europlots (tertiary — EU region for geographic diversity)
+    # Provider: confirmed from MEMORY.md (secrets service, DSEQ 24672527)
+    # Note: Infisical already runs here — co-locate for low-latency secret fetch
+    # ─────────────────────────────────────────────────────────────────────────
+    europlots-eu:
+      attributes:
+        host: akash
+        tier: community
+        region: eu
+      signedBy:
+        anyOf:
+          # TODO: Add Europlots provider address (confirm from `akash provider list`)
+          - PLACEHOLDER_EUROPLOTS_PROVIDER_ADDRESS
+      pricing:
+        swarm-runtime:
+          denom: uakt
+          amount: 1800
+        dapr-sidecar:
+          denom: uakt
+          amount: 180
+
+deployment:
+  swarm-runtime:
+    zanthem-primary:
+      profile: swarm-runtime
+      count: 2                  # 2 pods × 100 actors = 200 agents baseline; KEDA scales to 10
+
+  dapr-sidecar:
+    zanthem-primary:
+      profile: dapr-sidecar
+      count: 2                  # Must match swarm-runtime count (1 sidecar per runtime pod)
+
+  # redis deployment REMOVED — superseded by Turso L1 embedded libSQL (OQ-9 #144).
+
+# ─────────────────────────────────────────────────────────────────────────────
+# NOTES
+#
+# 1. RESTRICTED POD deployment (Tier A hardware):
+#    See swarm-runtime-restricted.sdl (to be created when Tier A hardware is confirmed).
+#    Per RFC-001 OQ-4: AWS/GCP initially for RESTRICTED POD — not Akash.
+#    This SDL is OPEN POOL (Tier C) only.
+#
+# 2. Image registry:
+#    ECR (219282777226.dkr.ecr.us-east-1.amazonaws.com) requires IAM auth.
+#    Akash providers cannot pull from private ECR without credentials.
+#    Before production: push to Docker Hub or GHCR with a public/token-auth image.
+#
+# 3. Yggdrasil provider exclusion:
+#    provider.provider.yggdrasil-compute.com DNS is broken (MEMORY.md).
+#    Do NOT add to signedBy lists.
+#
+# 4. Provider addresses:
+#    Subangle and Europlots provider addresses marked PLACEHOLDER above.
+#    Confirm with: `akash provider list | grep -E "subangle|europlots"`
+#
+# 5. Dapr component configs:
+#    dapr-sidecar mounts /components and /config from persistent storage.
+#    These must be populated with the YAML from infrastructure/k8s/swarm-runtime/components.yaml
+#    (adapted for non-K8s Akash deployment — secrets injected as env vars, not K8s secrets).
+# ─────────────────────────────────────────────────────────────────────────────

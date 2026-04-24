@@ -1,0 +1,52 @@
+[package]
+name = "af-swarm-runtime"
+version = "0.1.0"
+edition = "2021"
+description = "AF Swarm Runtime — Rust process above the Dapr sidecar"
+license = "Apache-2.0"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# In-process actor framework (ractor — zero-unsafe, Erlang-style supervision)
+ractor = "0.9"
+
+# In-process bounded MPMC channels (Flume — zero-unsafe, replaces kanal per v3.0 §3.2 review)
+flume = "0.11"
+
+# Dapr SDK (actor host, state store, pub/sub, workflow)
+# NOTE: pre-1.0 — see OQ-RI-2 in rust-runtime-internals.md
+dapr = "0.14"
+
+# gRPC transport for Dapr SDK
+tonic = "0.11"
+
+# Serialization — serde for snapshot, prost for L3 wire format
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+prost = "0.12"
+
+# Unique IDs
+uuid = { version = "1", features = ["v4", "serde"] }
+
+# Time
+chrono = { version = "0.4", features = ["serde"] }
+
+# Concurrent data structures (dispatch table, active agent registry)
+dashmap = "5"
+
+# Observability
+prometheus = "0.13"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# HTTP server for Dapr activation listener
+axum = "0.7"
+
+# Error handling
+thiserror = "1"
+anyhow = "1"
+
+[dev-dependencies]
+tokio-test = "0.4"

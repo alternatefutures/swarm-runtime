@@ -1,0 +1,124 @@
+// crates/af-swarm-state/proto/agent_state.proto
+// Primary agent state record — the root record read on every agent hydration.
+//
+// Key format: {tenant_id}||{agent_id}||state
+// Design: docs/architecture/design/state-schema.md §3.3
+// Issue: alternatefutures/admin#134
+//
+// Size budget: ≤64 KB. Heavy payloads (working memory, conversation history,
+// embeddings) are stored under separate Dapr keys and lazy-loaded.
+
+syntax = "proto3";
+
+package af.swarm.state;
+
+import "google/protobuf/timestamp.proto";
+import "common.proto";
+import "encryption.proto";
+
+option go_package = "github.com/alternatefutures/swarm/state;state";
+
+// ────────────────────────────────────────────────────────────────────────────
+// AgentStateRecord
+// ────────────────────────────────────────────────────────────────────────────
+message AgentStateRecord {
+  // ── Identity ──────────────────────────────────────────────────────────────
+  string tenant_id = 1;
+  string agent_id = 2;
+  // Semver of the agent TOML config that produced this state.
+  // Used to detect agent config changes between freeze and hydration.
+  string agent_version = 3;
+
+  // ── Lifecycle ─────────────────────────────────────────────────────────────
+  AgentLifecycleStatus status = 4;
+  google.protobuf.Timestamp last_frozen_at = 5;
+  google.protobuf.Timestamp last_hydrated_at = 6;
+  // Monotonic count of hydration events; useful for detecting runaway re-hydration.
+  uint64 hydration_count = 7;
+
+  // ── Active task context (set when ACTIVE, cleared on freeze) ──────────────
+  // Empty string when FROZEN.
+  string current_task_id = 8;
+  // Serialized TaintContext proto (DSE, v3.0 §5.3.2). Empty when FROZEN.
+  // Contains the DSE effective_tier and taint_sources for the current task.
+  bytes current_task_taint = 9;
+
+  // ── Working memory reference (lazy-loaded) ────────────────────────────────
+  // Dapr key for the associated WorkingMemoryRecord.
+  // Typically: {tenant_id}||{agent_id}||working_memory
+  string working_memory_key = 10;
+  // Must match WorkingMemoryRecord.version. A mismatch indicates a torn write
+  // → trigger checkpoint recovery (state-schema.md §7.3).
+  uint64 working_memory_version = 11;
+
+  // ── Conversation history ──────────────────────────────────────────────────
+  uint64 total_turns = 12;
+  // ULID of the most recent ConversationTurnRecord. Used as a starting point
+  // for reverse-order turn iteration without a full index scan.
+  string latest_turn_id = 13;
+
+  // ── Goal stack ────────────────────────────────────────────────────────────
+  // Active goal frames, ordered outermost-first (index 0 = root goal).
+  // Goals survive across task boundaries (persist through freeze/hydrate cycles).
+  // Max: 32 goal frames.
+  repeated GoalFrame goal_stack = 14;
+
+  // ── Pinned facts ──────────────────────────────────────────────────────────
+  // Cross-session high-confidence facts. Replicated into working memory slots
+  // 0–3 on every hydration. Max: 64 entries (OQ-S5).
+  repeated PinnedFact pinned_facts = 15;
+
+  // ── Embedding index references ────────────────────────────────────────────
+  // LanceDB record IDs for this agent's long-term memory entries.
+  // Vectors are NOT stored here — they live in LanceDB (state-schema.md §6).
+  // This list is the reconciliation source for LanceDB GC (prune vectors
+  // that are no longer referenced by any agent).
+  repeated string lancedb_record_ids = 16;
+
+  // ── Encryption ────────────────────────────────────────────────────────────
+  // Present when DSE sensitivity >= SENSITIVE (state-schema.md §8).
+  // When set, all sensitive fields above are encrypted in envelope.ciphertext.
+  // The fields tenant_id, agent_id, encryption.scheme, encryption.key_id
+  // remain plaintext to enable key lookup.
+  // Argus (#133) owns key management; see OQ-S2.
+  EncryptionEnvelope encryption = 17;
+
+  // ── Schema versioning ─────────────────────────────────────────────────────
+  // Monotonic integer incremented on each breaking schema change.
+  // Migration dispatch uses this to apply the correct StateMigration chain.
+  // Current value: 1 (initial schema).
+  uint32 schema_version = 18;
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// GoalFrame
+// ────────────────────────────────────────────────────────────────────────────
+message GoalFrame {
+  string goal_id = 1;       // ULID
+  string description = 2;   // Human-readable goal description, max 1KB
+  GoalStatus status = 3;
+  google.protobuf.Timestamp created_at = 4;
+  // Direct child goal IDs. Enables recursive goal decomposition without
+  // embedding full child frames (which would blow up the parent record).
+  // Children are fetched lazily if needed.
+  repeated string sub_goal_ids = 5;
+  // Which task_id achieved this goal's completion (set when status = COMPLETED)
+  string completed_by_task_id = 6;
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// PinnedFact
+// ────────────────────────────────────────────────────────────────────────────
+message PinnedFact {
+  string fact_id = 1;      // ULID
+  string content = 2;      // Plain text, max 2KB
+  // Relevance score updated on each access (decay model TBD, see MemAgent paper).
+  // Used to evict lowest-relevance pinned facts when the 64-cap is reached.
+  float relevance_score = 3;
+  google.protobuf.Timestamp pinned_at = 4;
+  google.protobuf.Timestamp last_accessed_at = 5;
+  // Which conversation turn produced this fact (for audit tracing).
+  string source_turn_id = 6;
+  // DSE data class of this fact's content (for taint propagation on retrieval).
+  DataClass data_class = 7;
+}

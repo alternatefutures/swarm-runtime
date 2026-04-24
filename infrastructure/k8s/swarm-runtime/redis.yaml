@@ -1,0 +1,133 @@
+# REMOVED: Redis Sentinel — Hot State Store
+# Issue: alternatefutures/admin#130
+# Rework: PR #140 — Redis removed per OQ-9 resolution (#144)
+#
+# Redis is SUPERSEDED by Turso L1 (embedded libSQL/SQLite) for the hot state path.
+# This file is retained as a tombstone; all Redis resource definitions below are DEPRECATED.
+# Do NOT apply this manifest. It will be deleted in a follow-up cleanup PR.
+#
+# Replacement:
+#   - Turso L1: embedded per-pod (no StatefulSet needed — PVC in deployment.yaml)
+#   - SurrealDB L2: see infrastructure/k8s/swarm-runtime/surrealdb-l2.yaml
+#
+# OQ-I5 (Redis Sentinel vs Cluster) is CLOSED — no longer applicable.
+#
+# ─────────────────────────────────────────────────────────────────────────────
+# DEPRECATED content below — do NOT apply
+# ─────────────────────────────────────────────────────────────────────────────
+
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: swarm-redis
+  namespace: swarm-runtime
+  labels:
+    app: swarm-redis
+    app.kubernetes.io/part-of: af-swarm-runtime
+spec:
+  serviceName: swarm-redis-headless
+  replicas: 3   # Sentinel quorum requires 3 nodes
+  selector:
+    matchLabels:
+      app: swarm-redis
+  template:
+    metadata:
+      labels:
+        app: swarm-redis
+    spec:
+      containers:
+        - name: redis
+          image: redis:7.2-alpine
+          command:
+            - redis-server
+            - /etc/redis/redis.conf
+          ports:
+            - name: redis
+              containerPort: 6379
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "256Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"
+          volumeMounts:
+            - name: redis-config
+              mountPath: /etc/redis
+            - name: redis-data
+              mountPath: /data
+          livenessProbe:
+            exec:
+              command: ["redis-cli", "ping"]
+            initialDelaySeconds: 10
+            periodSeconds: 10
+      volumes:
+        - name: redis-config
+          configMap:
+            name: swarm-redis-config
+  volumeClaimTemplates:
+    - metadata:
+        name: redis-data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 5Gi  # Adjust based on actor count and state size
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: swarm-redis-config
+  namespace: swarm-runtime
+data:
+  redis.conf: |
+    # TLS 1.3 (matches v3.0 §5.5 Layer requirements)
+    # TODO: Mount TLS certs before enabling
+    # tls-port 6380
+    # tls-cert-file /tls/tls.crt
+    # tls-key-file /tls/tls.key
+    # tls-ca-cert-file /tls/ca.crt
+    # tls-auth-clients yes
+
+    # Persistence — AOF for durability (hot tier is ephemeral by design, but AOF
+    # prevents data loss on pod restart within the TTL window)
+    appendonly yes
+    appendfsync everysec
+
+    # Memory policy — allkeys-lru evicts oldest LRU keys when maxmemory reached
+    # This matches the hot-tier design: Redis evicts; PostgreSQL is the source of truth
+    maxmemory 400mb
+    maxmemory-policy allkeys-lru
+
+    # Keyspace notifications for TTL expiry events (used by runtime to detect evictions)
+    notify-keyspace-events "Ex"
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: swarm-redis
+  namespace: swarm-runtime
+spec:
+  selector:
+    app: swarm-redis
+  ports:
+    - port: 6379
+      targetPort: 6379
+  type: ClusterIP
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: swarm-redis-headless
+  namespace: swarm-runtime
+spec:
+  selector:
+    app: swarm-redis
+  clusterIP: None
+  ports:
+    - port: 6379
+      targetPort: 6379

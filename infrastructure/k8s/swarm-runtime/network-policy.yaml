@@ -1,0 +1,119 @@
+# Network Policies for Swarm Runtime
+# Issue: alternatefutures/admin#130
+# Track: Infrastructure — Dapr deployment substrate
+#
+# Security invariant (RFC-001 §1.2):
+#   "RESTRICTED data never enters the OPEN POOL"
+#
+# The policy between namespaces enforces this at the network layer.
+# argus (#133) owns the detailed policy definitions — this file provides skeletons.
+#
+# TODO argus (#133): Review all policies in this file before production deployment.
+
+---
+# Default deny all in open pool namespace
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-all
+  namespace: swarm-runtime
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+    - Egress
+
+---
+# Allow swarm runtime pods to communicate within namespace
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-intra-namespace
+  namespace: swarm-runtime
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/part-of: af-swarm-runtime
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: swarm-runtime
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: swarm-runtime
+
+---
+# Allow swarm runtime pods to reach NATS (EC2, external)
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-nats-egress
+  namespace: swarm-runtime
+spec:
+  podSelector:
+    matchLabels:
+      app: swarm-runtime
+  policyTypes:
+    - Egress
+  egress:
+    - ports:
+        - protocol: TCP
+          port: 4222   # NATS
+        - protocol: TCP
+          port: 8222   # NATS monitoring (KEDA)
+      to:
+        - ipBlock:
+            cidr: "44.223.242.234/32"   # EC2 NATS server (Elastic IP from MEMORY.md)
+
+---
+# Allow swarm runtime pods to reach Infisical (secrets)
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-infisical-egress
+  namespace: swarm-runtime
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/part-of: af-swarm-runtime
+  policyTypes:
+    - Egress
+  egress:
+    - ports:
+        - protocol: TCP
+          port: 443
+      to:
+        - ipBlock:
+            # Europlots Akash ingress — Infisical (ddchr1pel5e0p8i0c46drjpclg.ingress.europlots.com)
+            # TODO: Resolve IP and set CIDR, or use DNS-based policy if CNI supports it
+            cidr: "0.0.0.0/0"  # PLACEHOLDER — argus to restrict to Europlots IP range
+
+---
+# HARD BLOCK: Prevent open-pool namespace from reaching restricted namespace
+# This is the key isolation policy — RESTRICTED data must never flow to OPEN POOL
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: block-restricted-ingress
+  namespace: swarm-runtime-restricted
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+  ingress:
+    # Explicitly deny all ingress from open-pool namespace
+    # TODO argus (#133): Define the exact allowed ingress sources for restricted pod
+    # (e.g., specific CI/CD pipeline pods, monitoring, etc.)
+    - from:
+        - namespaceSelector:
+            matchExpressions:
+              - key: kubernetes.io/metadata.name
+                operator: NotIn
+                values:
+                  - swarm-runtime  # Explicitly block open-pool namespace

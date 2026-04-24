@@ -1,0 +1,228 @@
+// proto/af-swarm/orchestrator_agent.proto
+//
+// Contract between the OrchestratorActor and AgentActors.
+//
+// TRANSPORT NOTE:
+//   L1 (in-process, ~80ns): Native Rust types in crates/af-swarm-runtime/src/agent.rs
+//     — mirrored from these proto messages. No serialization on L1.
+//   L3 (cross-machine, ~50–80µs): prost-serialized NatsEnvelope wrapping these messages.
+//     — Quinn (#134) owns the L3 wire encoding; these messages are the schema source.
+//
+// Type ownership: AgentId, TaskId, etc. live in crates/af-swarm-types (CL-002).
+// See rust-runtime-internals.md §6.1 for native Rust type definitions (Lain #137).
+//
+// Integration contract: docs/architecture/design/integration-contract.md §3.3
+
+syntax = "proto3";
+
+package af.swarm.v1;
+
+option java_package = "ai.alternatefutures.swarm.v1";
+option go_package = "github.com/alternatefutures/swarm/v1";
+
+import "google/protobuf/timestamp.proto";
+import "google/protobuf/duration.proto";
+import "proto/af-swarm/common.proto";
+
+// ---------------------------------------------------------------------------
+// Task dispatch (Orchestrator → Agent)
+// ---------------------------------------------------------------------------
+
+// Primary message type dispatched from OrchestratorActor to AgentActor.
+// Corresponds to AgentMessage::Task(TaskDispatch) in Lain #137 §6.1.
+message TaskDispatch {
+  TaskId task_id = 1;
+  AgentId target_agent_id = 2;
+  TenantId tenant_id = 3;
+  // Dapr workflow instance this task belongs to (optional).
+  WorkflowInstanceId workflow_instance_id = 4;
+  TaskPayload payload = 5;
+  TaskPriority priority = 6;
+  // Hard deadline. Agent must complete or yield by this time.
+  google.protobuf.Timestamp deadline = 7;
+  // Effective DSE tier for this task. Determines inference pool routing.
+  SensitivityLevel effective_tier = 8;
+  // Max tokens this task may consume in inference.
+  uint32 max_tokens = 9;
+  // AgentId of the requesting agent/orchestrator (for audit and reply routing).
+  AgentId requester_id = 10;
+  // Parent task ID (if this is a sub-agent delegation).
+  TaskId parent_task_id = 11;
+  TraceContext trace_context = 12;
+  // Whether the orchestrator expects a streaming result.
+  bool streaming = 13;
+}
+
+message TaskPayload {
+  // Human-readable task description. Goes into agent's prompt.
+  string prompt = 1;
+  // Structured context (JSON). Merged into agent working memory on hydration.
+  bytes context_json = 2;
+  // Attached artifacts (file paths, URLs, etc.).
+  repeated TaskArtifact artifacts = 3;
+}
+
+message TaskArtifact {
+  string name = 1;
+  // "file", "url", "inline"
+  string artifact_type = 2;
+  // URI or inline content.
+  string value = 3;
+  SensitivityLevel sensitivity = 4;
+}
+
+// ---------------------------------------------------------------------------
+// Task result (Agent → Orchestrator)
+// ---------------------------------------------------------------------------
+
+message TaskResult {
+  TaskId task_id = 1;
+  AgentId agent_id = 2;
+  TenantId tenant_id = 3;
+  TaskResultStatus status = 4;
+  // Output content (if status == SUCCESS).
+  string output = 5;
+  // Structured output (JSON, if agent produced structured data).
+  bytes output_json = 6;
+  // Error detail (if status == FAILED or CANCELLED).
+  AfErrorDetail error = 7;
+  // Token usage for cost attribution.
+  TokenUsage token_usage = 8;
+  google.protobuf.Timestamp completed_at = 9;
+  // Duration of task execution (wall clock, including inference time).
+  google.protobuf.Duration execution_duration = 10;
+  // Sub-agent results (if this agent delegated sub-tasks).
+  repeated SubAgentResult sub_agent_results = 11;
+  TraceContext trace_context = 12;
+}
+
+enum TaskResultStatus {
+  TASK_RESULT_STATUS_UNSPECIFIED = 0;
+  SUCCESS = 1;
+  FAILED = 2;
+  CANCELLED = 3;
+  TIMEOUT = 4;
+  BUDGET_EXHAUSTED = 5;  // Token or cost budget hit; partial result may be in `output`.
+}
+
+message SubAgentResult {
+  AgentId agent_id = 1;
+  TaskId task_id = 2;
+  TaskResultStatus status = 3;
+  string output = 4;
+  TokenUsage token_usage = 5;
+}
+
+// Streaming result chunk (if TaskDispatch.streaming == true).
+message TaskResultChunk {
+  TaskId task_id = 1;
+  AgentId agent_id = 2;
+  oneof chunk {
+    string text = 3;
+    TaskResult final_result = 4;  // Last chunk; contains full TokenUsage, etc.
+  }
+  TraceContext trace_context = 5;
+}
+
+// ---------------------------------------------------------------------------
+// Direct agent-to-agent messages (irregular peer connections)
+// RFC §1.4: agents can directly message each other when task affinity is high.
+// Corresponds to AgentMessage::DirectMessage in Lain #137 §6.1.
+// ---------------------------------------------------------------------------
+
+message DirectMessage {
+  AgentId from_agent_id = 1;
+  AgentId to_agent_id = 2;
+  TenantId tenant_id = 3;
+  // Correlation ID for request/response pairing.
+  string correlation_id = 4;
+  // Message type (agent-protocol-level). e.g. "review_request", "data_share"
+  string message_type = 5;
+  // Flexible payload. Structure defined per message_type.
+  bytes payload_json = 6;
+  SensitivityLevel sensitivity = 7;
+  TraceContext trace_context = 8;
+}
+
+// ---------------------------------------------------------------------------
+// Lifecycle commands (Orchestrator → Agent)
+// Corresponds to AgentMessage::LifecycleCommand in Lain #137 §6.1.
+// ---------------------------------------------------------------------------
+
+message LifecycleCommand {
+  AgentId agent_id = 1;
+  LifecycleCommandType command = 2;
+  string reason = 3;
+  TraceContext trace_context = 4;
+}
+
+enum LifecycleCommandType {
+  LIFECYCLE_COMMAND_TYPE_UNSPECIFIED = 0;
+  DRAIN = 1;       // Stop accepting new tasks; complete in-flight; then Freeze.
+  FREEZE = 2;      // Immediately freeze (emergency).
+  QUARANTINE = 3;  // Freeze + mark quarantined; do not rehydrate without explicit Recover.
+  RECOVER = 4;     // Clear quarantine; allow rehydration.
+}
+
+// ---------------------------------------------------------------------------
+// Backpressure (Runtime → Orchestrator)
+// OrchestratorActor checks this before dispatching new tasks.
+// Corresponds to BackpressureStatus in Lain #137 §6.2.
+// ---------------------------------------------------------------------------
+
+message BackpressureStatus {
+  uint32 active_agent_count = 1;
+  uint32 active_agent_limit = 2;
+  // L3 NATS egress buffer fill. 0.0–1.0.
+  float l3_egress_buffer_fill = 3;
+  // Number of pending hydration requests queued in SwarmSupervisor.
+  uint32 pending_hydrations = 4;
+  MemoryPressureLevel memory_pressure = 5;
+  // If true: halve dispatch rate, no new hydrations until pressure drops.
+  bool should_throttle = 6;
+  // If true: emergency; stop all new dispatches immediately.
+  bool is_critical = 7;
+}
+
+enum MemoryPressureLevel {
+  MEMORY_PRESSURE_LEVEL_UNSPECIFIED = 0;
+  NONE = 1;
+  LOW = 2;
+  HIGH = 3;
+  CRITICAL = 4;
+}
+
+// ---------------------------------------------------------------------------
+// Broadcast events (L2 tokio::broadcast — advisory only, loss acceptable)
+// ---------------------------------------------------------------------------
+
+// Generic broadcast event envelope.
+// Agents subscribe via L2BroadcastActor.subscribe(topic_id).
+// See Lain #137 §2.2 for L2 channel topology.
+message BroadcastEvent {
+  string topic_id = 1;
+  BroadcastEventType event_type = 2;
+  // Serialized event payload. Type depends on event_type.
+  bytes payload = 3;
+  google.protobuf.Timestamp emitted_at = 4;
+  TraceContext trace_context = 5;
+}
+
+enum BroadcastEventType {
+  BROADCAST_EVENT_TYPE_UNSPECIFIED = 0;
+  AGENT_QUARANTINED = 1;   // payload: AgentQuarantinedEvent (see runtime_dapr.proto)
+  BACKPRESSURE_UPDATE = 2; // payload: BackpressureStatus
+  TOPOLOGY_CHANGE = 3;     // payload: TopologyChangeEvent (peer affinity update)
+  CLUSTER_STATUS = 4;      // payload: ClusterStatusResponse (from inference cluster)
+}
+
+// Published when irregular peer affinity topology changes.
+// See RFC §1.4 (Qian et al., NeurIPS: irregular topologies at >1000 agents).
+message TopologyChangeEvent {
+  // Agent that now has a direct peer connection.
+  AgentId agent_id = 1;
+  // Peer agents it can send DirectMessage to without orchestrator routing.
+  repeated AgentId peer_agent_ids = 2;
+  // Reason for topology change. e.g. "task_affinity", "colocation"
+  string reason = 3;
+}

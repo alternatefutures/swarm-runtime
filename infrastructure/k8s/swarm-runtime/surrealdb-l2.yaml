@@ -1,0 +1,137 @@
+# State Store Infrastructure — SurrealDB L2 Cluster (Phase A: AWS)
+# Issue: alternatefutures/admin#130
+# Track: Infrastructure — Dapr deployment substrate
+# Rework: PR #140 — replaces redis.yaml (Redis removed per OQ-9 resolution #144)
+#
+# Redis Sentinel StatefulSet REMOVED. This file defines the SurrealDB L2 cluster.
+#
+# Turso L1 (embedded libSQL/SQLite) requires no separate K8s workload — it is embedded
+# in the swarm-runtime binary. The runtime pod's PVC (/data/turso/actor.db) is its
+# storage. See deployment.yaml for the AF_SWARM_L1_DB_PATH volume mount.
+#
+# SurrealDB L2: 3-node Raft cluster for durable agent checkpoints.
+#   Phase A (Q2 2026): AWS stable tier — apply in namespace: aws-stable
+#   Phase B (Q3 2026): AF B300 bare-metal — update endpoints per issue #168 §10
+#
+# Per dapr-deployment.md §10.2: SurrealDB L2 is NOT an Akash workload.
+# Apply this manifest to the AWS cluster, not the Akash execution cluster.
+# Namespace: aws-stable (created separately; not in this repo's swarm-runtime/ directory)
+
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: surrealdb-l2
+  namespace: aws-stable
+  labels:
+    app: surrealdb-l2
+    app.kubernetes.io/part-of: af-swarm-stable-tier
+    tier: stable
+spec:
+  serviceName: surrealdb-l2-headless
+  replicas: 3   # 3-node Raft quorum
+  selector:
+    matchLabels:
+      app: surrealdb-l2
+  template:
+    metadata:
+      labels:
+        app: surrealdb-l2
+        role: surrealdb-l2
+    spec:
+      containers:
+        - name: surrealdb
+          image: surrealdb/surrealdb:v2.1.0
+          command:
+            - surreal
+            - start
+          args:
+            - "--log=info"
+            - "--user=$(SURREAL_USER)"
+            - "--pass=$(SURREAL_PASS)"
+            - "--bind=0.0.0.0:8000"
+            # Raft consensus — each node joins the cluster on startup
+            # TODO: Configure cluster bootstrap addresses before production deploy
+            - "rocksdb:/data/surreal"   # NVMe-backed RocksDB storage
+          ports:
+            - name: surreal-http
+              containerPort: 8000
+            - name: surreal-raft
+              containerPort: 8001
+          env:
+            - name: SURREAL_USER
+              valueFrom:
+                secretKeyRef:
+                  name: swarm-surrealdb-secret
+                  key: username
+            - name: SURREAL_PASS
+              valueFrom:
+                secretKeyRef:
+                  name: swarm-surrealdb-secret
+                  key: password
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "1Gi"
+            limits:
+              cpu: "2000m"
+              memory: "4Gi"
+          volumeMounts:
+            - name: surreal-data
+              mountPath: /data
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 15
+            periodSeconds: 15
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 5
+            periodSeconds: 10
+  volumeClaimTemplates:
+    - metadata:
+        name: surreal-data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        storageClassName: gp3   # AWS gp3 NVMe-backed SSD
+        resources:
+          requests:
+            storage: 50Gi   # Checkpoint blobs per agent; scale based on agent count
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: surrealdb-l2
+  namespace: aws-stable
+  labels:
+    app: surrealdb-l2
+spec:
+  selector:
+    app: surrealdb-l2
+  ports:
+    - name: http
+      port: 8000
+      targetPort: 8000
+  type: ClusterIP
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: surrealdb-l2-headless
+  namespace: aws-stable
+spec:
+  selector:
+    app: surrealdb-l2
+  clusterIP: None
+  ports:
+    - name: http
+      port: 8000
+      targetPort: 8000
+    - name: raft
+      port: 8001
+      targetPort: 8001

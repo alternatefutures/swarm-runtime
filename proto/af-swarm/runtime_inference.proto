@@ -1,0 +1,232 @@
+// proto/af-swarm/runtime_inference.proto
+//
+// Contract between the AF Swarm Runtime (Rust) and the Shared Inference Cluster.
+//
+// Callers: OrchestratorActor (Kimi K2.5 orchestration), AgentActors (task inference).
+// Server:  Ray Serve routing layer (Atlas #132, pending).
+//
+// CRITICAL ROUTING RULES (Argus #138 §2.1):
+//   - effective_tier == RESTRICTED → RestrictedPod. If unavailable: REJECT (AF-006).
+//     DO NOT fall back to OpenPool under any failure mode.
+//   - effective_tier != RESTRICTED → OpenPool.
+//   - The inference_tier field in InferenceRequest is authoritative for routing.
+//   - Ray Serve MUST verify InferenceIdentityClaim signature (Ed25519 NKey).
+//
+// OTel: trace_context is REQUIRED on every request. Atlas must propagate into
+//       Ray Serve spans and vLLM spans.
+//
+// Integration contract: docs/architecture/design/integration-contract.md §3.2
+
+syntax = "proto3";
+
+package af.swarm.v1;
+
+option java_package = "ai.alternatefutures.swarm.v1";
+option go_package = "github.com/alternatefutures/swarm/v1";
+
+import "google/protobuf/timestamp.proto";
+import "proto/af-swarm/common.proto";
+
+// ---------------------------------------------------------------------------
+// Inference service (Ray Serve exposes; Rust runtime calls)
+// ---------------------------------------------------------------------------
+service InferenceService {
+  // Submit a non-streaming inference request. Returns when generation is complete.
+  // Timeout: inference.first_token_timeout_ms (30s default) for first token;
+  //          inference.stream_total_timeout_ms (300s) for full response.
+  // TODO: implementation in Phase NEW (Inference Cluster Setup, Atlas #132)
+  rpc Infer(InferenceRequest) returns (InferenceResponse);
+
+  // Submit a streaming inference request. Server streams tokens as they are generated.
+  // Client-side: collect tokens until StreamComplete or stream closes.
+  // TODO: implementation in Phase NEW (Inference Cluster Setup, Atlas #132)
+  rpc InferStream(InferenceRequest) returns (stream InferenceStreamChunk);
+
+  // Cancel an in-flight inference request. Best-effort.
+  // Use case: orchestrator detects task cancellation (A2A /cancel or MAST circuit breaker).
+  // TODO: implementation in Phase NEW (Inference Cluster Setup, Atlas #132)
+  rpc Cancel(InferenceCancelRequest) returns (InferenceCancelResponse);
+
+  // Health check. Returns cluster status and active request counts.
+  // OrchestratorActor polls this to detect RESTRICTED POD unavailability.
+  // TODO: implementation in Phase NEW (Inference Cluster Setup, Atlas #132)
+  rpc ClusterStatus(ClusterStatusRequest) returns (ClusterStatusResponse);
+}
+
+// ---------------------------------------------------------------------------
+// Identity claim (required on every request)
+// Argus #138 §2.4: verified by Ray Serve routing layer before dispatch.
+// ---------------------------------------------------------------------------
+
+// Ed25519 signature over: task_id || agent_id || tenant_id || effective_tier_byte || timestamp_unix_secs
+// Uses the same NKey infrastructure as v3.0 §5.2 S5 (agent identity).
+// Key management: Infisical on Tier A (integration-contract.md §4.5 / Argus #138 §3.4).
+message InferenceIdentityClaim {
+  AgentId agent_id = 1;
+  TenantId tenant_id = 2;
+  // Effective DSE tier for this request. Determines inference pool routing.
+  SensitivityLevel effective_tier = 3;
+  // Ed25519 signature (64 bytes). Covers: task_id + agent_id + tenant_id + effective_tier + timestamp.
+  bytes signature = 4;
+  // Unix timestamp (seconds). Claim is valid for ±30 seconds (replay protection).
+  int64 timestamp_unix_secs = 5;
+  // NKey public key (agent identity). Matches agent's Ed25519 key in v3.0 §5.2 S5.
+  string nkey_public_key = 6;
+}
+
+// ---------------------------------------------------------------------------
+// Inference request / response
+// ---------------------------------------------------------------------------
+
+message InferenceRequest {
+  TaskId task_id = 1;
+  // Model ID. e.g. "kimi-k2.5", "claude-sonnet-4-6", "qwen2.5-0.5b"
+  // Must match a model registered in the inference cluster.
+  string model_id = 2;
+  // Prompt messages (OpenAI-compatible format).
+  repeated ChatMessage messages = 3;
+  // Maximum tokens to generate.
+  uint32 max_tokens = 4;
+  // Temperature. Default 0.7 for creative tasks; 0.0 for classification.
+  float temperature = 5;
+  // Identity claim for routing and cost attribution.
+  InferenceIdentityClaim identity_claim = 6;
+  // Inference tier derived from effective_tier in identity_claim.
+  // Redundant with identity_claim.effective_tier but explicit for routing layer.
+  // MUST be consistent with identity_claim.effective_tier or request is rejected (AF-005).
+  InferenceTier inference_tier = 7;
+  // KV cache namespace key. Format: "{tenant_id}:{dse_tier}:{team_id}"
+  // See integration-contract.md §5 CL-004. Pending atlas (#132) confirmation.
+  // RESTRICTED tier: set to empty string (no KV cache sharing, Argus #138 §4.5).
+  string kv_cache_namespace = 8;
+  TraceContext trace_context = 9;
+  // Tool definitions for tool-calling models. Enforced <= MAX_TOOLS_PER_AGENT=16.
+  repeated ToolDefinition tools = 10;
+  // Stop sequences.
+  repeated string stop_sequences = 11;
+}
+
+message ChatMessage {
+  // "system", "user", "assistant", "tool"
+  string role = 1;
+  string content = 2;
+  // For role="tool": tool call ID this is a response to.
+  string tool_call_id = 3;
+}
+
+message ToolDefinition {
+  string name = 1;
+  string description = 2;
+  // JSON Schema for the tool's input parameters.
+  string input_schema_json = 3;
+}
+
+message InferenceResponse {
+  TaskId task_id = 1;
+  string content = 2;
+  // Stop reason: "stop", "max_tokens", "tool_use", "cancelled"
+  string stop_reason = 3;
+  TokenUsage usage = 4;
+  // Latency from request receipt to first token (milliseconds).
+  uint64 first_token_latency_ms = 5;
+  // Latency from request receipt to last token.
+  uint64 total_latency_ms = 6;
+  // Which pool handled this request (for audit/cost attribution).
+  InferenceTier served_by = 7;
+  // Tool calls requested by the model (if stop_reason == "tool_use").
+  repeated ToolCall tool_calls = 8;
+  TraceContext trace_context = 9;
+}
+
+message ToolCall {
+  string id = 1;
+  string tool_name = 2;
+  // JSON-encoded tool input.
+  string input_json = 3;
+}
+
+message TokenUsage {
+  uint32 prompt_tokens = 1;
+  uint32 completion_tokens = 2;
+  uint32 total_tokens = 3;
+  // Cost in microdollars (USD × 1,000,000) for billing/attribution.
+  uint64 cost_microdollars = 4;
+}
+
+// ---------------------------------------------------------------------------
+// Streaming
+// ---------------------------------------------------------------------------
+
+message InferenceStreamChunk {
+  TaskId task_id = 1;
+  oneof chunk {
+    TokenChunk token = 2;
+    StreamComplete complete = 3;
+    StreamError error = 4;
+  }
+}
+
+message TokenChunk {
+  string text = 1;
+  uint32 token_index = 2;
+}
+
+message StreamComplete {
+  string stop_reason = 1;
+  TokenUsage usage = 2;
+  uint64 first_token_latency_ms = 3;
+  uint64 total_latency_ms = 4;
+  InferenceTier served_by = 5;
+  repeated ToolCall tool_calls = 6;
+}
+
+message StreamError {
+  // AF error code. e.g. "AF-006" if RESTRICTED POD failed mid-stream.
+  string error_code = 1;
+  string message = 2;
+  bool retryable = 3;
+}
+
+// ---------------------------------------------------------------------------
+// Cancellation
+// ---------------------------------------------------------------------------
+
+message InferenceCancelRequest {
+  TaskId task_id = 1;
+  InferenceIdentityClaim identity_claim = 2;
+  TraceContext trace_context = 3;
+}
+
+message InferenceCancelResponse {
+  bool cancelled = 1;
+  // "not_found" if task_id is unknown or already complete.
+  string status = 2;
+}
+
+// ---------------------------------------------------------------------------
+// Cluster status (OrchestratorActor health polling)
+// ---------------------------------------------------------------------------
+
+message ClusterStatusRequest {
+  TraceContext trace_context = 1;
+}
+
+message ClusterStatusResponse {
+  PoolStatus open_pool = 1;
+  PoolStatus restricted_pod = 2;
+  google.protobuf.Timestamp checked_at = 3;
+}
+
+message PoolStatus {
+  InferenceTier tier = 1;
+  bool healthy = 2;
+  // Active inference requests.
+  uint32 active_requests = 3;
+  // Queue depth (waiting requests).
+  uint32 queue_depth = 4;
+  // GPU utilization 0.0–1.0. 0.0 for CPU-only pools.
+  float gpu_utilization = 5;
+  // KV cache utilization 0.0–1.0.
+  float kv_cache_utilization = 6;
+  string last_health_error = 7;
+}

@@ -1,0 +1,78 @@
+// crates/af-swarm-state/proto/tool_call_log.proto
+// Immutable tool call log — audit trail for agent tool invocations (v3.0 S7).
+//
+// Key format: {tenant_id}||{agent_id}||tool_log||{log_id}
+// where log_id is a ULID.
+//
+// Design: docs/architecture/design/state-schema.md §3.6
+// Issue: alternatefutures/admin#134
+//
+// Size budget: ≤16 KB per entry.
+// TTL: 90 days default (configurable per-tenant for compliance, state-schema.md §9.3).
+//
+// OQ-S6: In Phase 1, tool logs are written to Dapr state store (mutable).
+// In Phase 12, these records will be integrated with the S7 hash-chain audit
+// log (immutable append-only). At that point, this record will be replicated
+// to the audit log, and the Dapr state store copy can be treated as a cache.
+
+syntax = "proto3";
+
+package af.swarm.state;
+
+import "google/protobuf/timestamp.proto";
+import "common.proto";
+import "encryption.proto";
+
+option go_package = "github.com/alternatefutures/swarm/state;state";
+
+// ────────────────────────────────────────────────────────────────────────────
+// ToolCallLogRecord
+// ────────────────────────────────────────────────────────────────────────────
+message ToolCallLogRecord {
+  // ── Identity ──────────────────────────────────────────────────────────────
+  string tenant_id = 1;
+  string agent_id = 2;
+  string log_id = 3;   // ULID
+  // Parent conversation turn. Used to traverse: state → turns → tool logs.
+  string turn_id = 4;
+
+  // ── Tool invocation ───────────────────────────────────────────────────────
+  string tool_name = 5;
+  // JSON-encoded tool input. Secrets are REDACTED before storage.
+  // The pattern scanner (v3.0 §5.3.1 Layer 3) must run before storage.
+  // Any detected CREDENTIAL or CRYPTO_KEY class values are replaced with
+  // "[REDACTED:DATA_CLASS]" to prevent secret leakage in the audit log.
+  bytes input = 6;
+  // JSON-encoded tool output. Same redaction rules apply.
+  bytes output = 7;
+  ToolCallStatus status = 8;
+  uint32 duration_ms = 9;
+
+  // ── Sandboxing ────────────────────────────────────────────────────────────
+  // Which sandbox executed this tool call (v3.0 §4.5)
+  SandboxType sandbox = 10;
+
+  // ── DSE taint ─────────────────────────────────────────────────────────────
+  // Serialized TaintContext for this tool invocation.
+  // Captures the effective_tier at the time of invocation for audit.
+  bytes taint_context = 11;
+
+  google.protobuf.Timestamp invoked_at = 12;
+
+  // ── Encryption ────────────────────────────────────────────────────────────
+  EncryptionEnvelope encryption = 13;
+
+  uint32 schema_version = 14;
+}
+
+enum SandboxType {
+  SANDBOX_TYPE_UNSPECIFIED = 0;
+  // Wasmtime WASM (primary sandbox, v3.0 §4.5)
+  WASMTIME = 1;
+  // bubblewrap Linux namespace isolation (fallback)
+  BUBBLEWRAP = 2;
+  // seccomp BPF syscall whitelist (last resort)
+  SECCOMP = 3;
+  // No sandbox (in-process, host-side — KV cache, metrics, etc.)
+  HOST_INLINE = 4;
+}

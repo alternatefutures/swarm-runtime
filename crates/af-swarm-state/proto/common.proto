@@ -1,0 +1,103 @@
+// crates/af-swarm-state/proto/common.proto
+// Shared enums and value types used across af-swarm-state proto definitions.
+// Issue: alternatefutures/admin#134
+
+syntax = "proto3";
+
+package af.swarm.state;
+
+option java_package = "ai.alternatefutures.swarm.state";
+option java_outer_classname = "CommonProto";
+option go_package = "github.com/alternatefutures/swarm/state;state";
+
+// ────────────────────────────────────────────────────────────────────────────
+// Agent Lifecycle
+// ────────────────────────────────────────────────────────────────────────────
+
+// Lifecycle state of a virtual actor agent.
+// An FROZEN agent consumes zero CPU and RAM; ACTIVE means hydrated in a ractor actor.
+enum AgentLifecycleStatus {
+  AGENT_LIFECYCLE_STATUS_UNSPECIFIED = 0;
+  // Agent is persisted to the Dapr state store. No ractor actor is running.
+  FROZEN = 1;
+  // Agent is hydrated. A ractor actor is processing a task.
+  ACTIVE = 2;
+  // Agent is completing its current task before being frozen.
+  DRAINING = 3;
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Goals
+// ────────────────────────────────────────────────────────────────────────────
+
+enum GoalStatus {
+  GOAL_STATUS_UNSPECIFIED = 0;
+  PENDING = 1;
+  IN_PROGRESS = 2;
+  BLOCKED = 3;
+  COMPLETED = 4;
+  FAILED = 5;
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Data Sensitivity Engine (DSE) — mirrors v3.0 §5.3
+// ────────────────────────────────────────────────────────────────────────────
+
+// Four-tier DSE sensitivity classification.
+// Must stay in sync with the SensitivityLevel enum in the DSE implementation.
+enum SensitivityLevel {
+  SENSITIVITY_LEVEL_UNSPECIFIED = 0;
+  PUBLIC = 1;
+  INTERNAL = 2;
+  SENSITIVE = 3;
+  RESTRICTED = 4;
+}
+
+// Canonical data class labels for DSE taint tracking.
+enum DataClass {
+  DATA_CLASS_UNSPECIFIED = 0;
+  PUBLIC_CONTENT = 1;
+  USER_PROFILE = 2;
+  INTERNAL_CONFIG = 3;
+  INTERNAL_METRICS = 4;
+  PII_CONTACT = 5;
+  PII_IDENTITY = 6;
+  FINANCIAL_ID = 7;
+  FINANCIAL_PCI = 8;
+  CREDENTIAL = 9;
+  CRYPTO_KEY = 10;
+  MODEL_WEIGHTS = 11;
+  AUDIT_LOG = 12;
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Tool Calls
+// ────────────────────────────────────────────────────────────────────────────
+
+enum ToolCallStatus {
+  TOOL_CALL_STATUS_UNSPECIFIED = 0;
+  SUCCESS = 1;
+  FAILED = 2;
+  TIMEOUT = 3;
+  // Agent attempted a tool call that violates its Wasmtime sandbox capabilities
+  SANDBOX_VIOLATION = 4;
+  // Tool call was blocked by DSE routing (e.g. RESTRICTED data on Tier C)
+  DSE_BLOCKED = 5;
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Encryption
+// ────────────────────────────────────────────────────────────────────────────
+
+enum EncryptionScheme {
+  ENCRYPTION_SCHEME_UNSPECIFIED = 0;
+  // No application-layer encryption; relies on Dapr store TLS only.
+  // Used for PUBLIC and INTERNAL sensitivity tiers.
+  PLAINTEXT = 1;
+  // AES-256-GCM with per-tenant key from Infisical.
+  // Used for SENSITIVE sensitivity tier.
+  AES_256_GCM = 2;
+  // TFHE-rs Fully Homomorphic Encryption.
+  // MANDATORY for RESTRICTED sensitivity tier on Tier B/C hardware (v3.0 §5.4).
+  FHE_TFHE_RS = 3;
+}

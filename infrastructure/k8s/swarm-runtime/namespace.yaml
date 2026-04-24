@@ -1,0 +1,31 @@
+# Swarm Runtime Kubernetes Namespace
+# Issue: alternatefutures/admin#130
+# Track: Infrastructure — Dapr deployment substrate
+#
+# Two namespaces:
+#   swarm-runtime          — OPEN POOL (Tier C): PUBLIC/INTERNAL/SENSITIVE workloads
+#   swarm-runtime-restricted — RESTRICTED POD (Tier A): RESTRICTED workloads only
+#
+# Per RFC-001 §1.2: "RESTRICTED data never enters the OPEN POOL"
+# These namespaces enforce that invariant at the K8s layer.
+
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: swarm-runtime
+  labels:
+    app.kubernetes.io/part-of: af-swarm-runtime
+    af/tier: "open-pool"
+    af/data-sensitivity: "sensitive-max"  # Max tier allowed in this namespace
+
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: swarm-runtime-restricted
+  labels:
+    app.kubernetes.io/part-of: af-swarm-runtime
+    af/tier: "restricted-pod"
+    af/data-sensitivity: "restricted"
+  # TODO argus (#133): Add additional labels/annotations for audit tooling

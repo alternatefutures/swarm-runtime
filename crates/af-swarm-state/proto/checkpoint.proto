@@ -1,0 +1,66 @@
+// crates/af-swarm-state/proto/checkpoint.proto
+// Full agent state snapshot for point-in-time recovery.
+//
+// Key format: {tenant_id}||{agent_id}||checkpoint||{seq_zero_padded_20}
+// where seq is a zero-padded 20-digit uint64 (lexicographic sort = numeric sort).
+//
+// Design: docs/architecture/design/state-schema.md §3.7, §7
+// Issue: alternatefutures/admin#134
+//
+// Size budget: ≤512 KB (embeds both AgentStateRecord and WorkingMemoryRecord).
+// Retention: last N checkpoints (default 5); compliance_retain_days override.
+
+syntax = "proto3";
+
+package af.swarm.state;
+
+import "google/protobuf/timestamp.proto";
+import "agent_state.proto";
+import "working_memory.proto";
+
+option go_package = "github.com/alternatefutures/swarm/state;state";
+
+// ────────────────────────────────────────────────────────────────────────────
+// CheckpointRecord
+// ────────────────────────────────────────────────────────────────────────────
+message CheckpointRecord {
+  // ── Identity ──────────────────────────────────────────────────────────────
+  string tenant_id = 1;
+  string agent_id = 2;
+  // Monotonic sequence number. Zero-padded in the Dapr key to enable
+  // lexicographic scan for "latest checkpoint" without a secondary index.
+  uint64 checkpoint_seq = 3;
+
+  // ── Trigger context ───────────────────────────────────────────────────────
+  // What caused this checkpoint to be written.
+  CheckpointTrigger trigger = 4;
+  // For trigger=PRE_TASK: the task ID that was about to execute.
+  string pre_task_id = 5;
+
+  // ── State snapshots ───────────────────────────────────────────────────────
+  // Full embedded snapshots at checkpoint time.
+  // These are the records that will be restored on torn-write recovery.
+  AgentStateRecord state_snapshot = 6;
+  WorkingMemoryRecord memory_snapshot = 7;
+
+  // ── Integrity ─────────────────────────────────────────────────────────────
+  // SHA-256 digest of: state_snapshot.SerializeToBytes() + memory_snapshot.SerializeToBytes()
+  // (concatenated, then hashed). Verified on recovery to detect tampered checkpoints.
+  // 32 bytes.
+  bytes sha256_digest = 8;
+
+  google.protobuf.Timestamp created_at = 9;
+  uint32 schema_version = 10;
+}
+
+enum CheckpointTrigger {
+  CHECKPOINT_TRIGGER_UNSPECIFIED = 0;
+  // Written on every ACTIVE → FROZEN transition (mandatory)
+  FREEZE = 1;
+  // Written every N turns by the periodic checkpoint task (configurable)
+  PERIODIC = 2;
+  // Written before executing a RESTRICTED-tier task (mandatory for RESTRICTED)
+  PRE_TASK = 3;
+  // Written by operator request or orchestrator directive
+  MANUAL = 4;
+}

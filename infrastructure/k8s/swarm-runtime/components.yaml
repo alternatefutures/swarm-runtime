@@ -1,0 +1,121 @@
+# Dapr Components for Swarm Runtime
+# Issue: alternatefutures/admin#130
+# Track: Infrastructure — Dapr deployment substrate
+# Rework: PR #140 chief-architect pair-review (OQ-9 state store, NATS split, substrate migration)
+#
+# Components defined here:
+#   1. [REMOVED] statestore-hot (Redis)       — superseded by Turso L1 embedded libSQL (OQ-9 #144)
+#   2. [REMOVED] statestore-cold (PostgreSQL) — superseded by SurrealDB L2 cluster (OQ-9 #144)
+#   3a. pubsub-nats-js    — NATS JetStream (durable: task/result/audit/lifecycle) (PR #141 §3.1)
+#   3b. pubsub-nats-core  — NATS Core (advisory: broadcast/backpressure/heartbeat) (PR #141 §3.1)
+#   4. workflow-backend   — Dapr Workflow (Phase 8 DAG execution harness)
+#   5. secretstore        — Infisical (existing AF secrets service)
+#
+# State store note (OQ-9 resolution, issue #144):
+#   Turso L1 (embedded libSQL/SQLite) runs inside the swarm-runtime binary as a Rust crate
+#   dependency — no Dapr state.* Component CRD is needed. Per-pod PVC at /data/turso/actor.db
+#   (set via AF_SWARM_L1_DB_PATH env var in deployment.yaml).
+#
+#   SurrealDB L2 is accessed via the surrealdb Rust client crate directly — no Dapr CRD.
+#   Connection URL injected via swarm-secretstore (key: surrealdb-url).
+#   Phase A: AWS; Phase B: AF B300 bare-metal (see dapr-deployment.md §10).
+#
+# Full spec: dapr-deployment.md §3, §4, §5
+# Secrets: secrets.yaml.template (gitignored actual values)
+
+---
+# 1. Pub/Sub — NATS JetStream (DURABLE topics)
+# dapr-deployment.md §4.2
+# Topics: agent.task.*, agent.result.*, agent.audit.*, agent.lifecycle.*
+# Ack-required, at-least-once delivery, JetStream stream SWARM.
+# Client-side enforcement: NatsEnvelope.topic_class == DURABLE required for this component.
+apiVersion: dapr.io/v1alpha1
+kind: Component
+metadata:
+  name: pubsub-nats-js
+  namespace: swarm-runtime
+spec:
+  type: pubsub.jetstream
+  version: v1
+  metadata:
+    - name: natsURL
+      secretKeyRef:
+        name: swarm-nats-secret
+        key: url     # nats://af:***@44.223.242.234:4222
+    - name: name
+      value: "swarm-runtime-js"
+    - name: durableName
+      value: "swarm-actor-events"
+    - name: streamName
+      value: "SWARM"
+    - name: deliverNew
+      value: "true"
+    - name: flowControl
+      value: "true"
+    - name: ackWaitTime
+      value: "30s"
+    - name: maxInFlight
+      value: "100"
+    # TODO: Set backoff strategy for message redelivery (coordinate with MAST FM taxonomy)
+auth:
+  secretStore: swarm-secretstore
+
+---
+# 2. Pub/Sub — NATS Core (ADVISORY topics)
+# dapr-deployment.md §4.3
+# Topics: agent.broadcast, agent.backpressure.*, agent.heartbeat.*
+# Best-effort, no ack, no JetStream stream persistence.
+# Client-side enforcement: NatsEnvelope.topic_class == ADVISORY required for this component.
+apiVersion: dapr.io/v1alpha1
+kind: Component
+metadata:
+  name: pubsub-nats-core
+  namespace: swarm-runtime
+spec:
+  type: pubsub.nats
+  version: v1
+  metadata:
+    - name: natsURL
+      secretKeyRef:
+        name: swarm-nats-secret
+        key: url
+    - name: name
+      value: "swarm-runtime-core"
+    - name: natsQueueGroupName
+      value: "swarm-advisory"
+auth:
+  secretStore: swarm-secretstore
+
+---
+# 3. Workflow backend
+# dapr-deployment.md §5
+# Dapr Workflow uses the actor state mechanism. With Turso L1 embedded, workflow state is
+# persisted via the same StateClient interface as agent state — no separate CRD needed.
+apiVersion: dapr.io/v1alpha1
+kind: Component
+metadata:
+  name: workflow-backend
+  namespace: swarm-runtime
+spec:
+  type: workflow.dapr
+  version: v1
+  # Intentionally empty metadata — Dapr Workflow delegates to actor state
+
+---
+# 4. Secret store — Infisical
+# Existing AF secrets service (ddchr1pel5e0p8i0c46drjpclg.ingress.europlots.com)
+# Secrets served: swarm-nats-secret (url), swarm-surrealdb-secret (url), fhe-key-material
+apiVersion: dapr.io/v1alpha1
+kind: Component
+metadata:
+  name: swarm-secretstore
+  namespace: swarm-runtime
+spec:
+  type: secretstores.hashicorp.vault   # TODO: Replace with native Infisical component when available
+  # Fallback: use generic HTTP component against Infisical API
+  # See: https://infisical.com/docs/integrations/platforms/kubernetes
+  version: v1
+  metadata:
+    - name: vaultAddress
+      value: "https://ddchr1pel5e0p8i0c46drjpclg.ingress.europlots.com"
+    # TODO: Confirm Infisical auth method with secrets admin; Vault-compatible endpoint or native?

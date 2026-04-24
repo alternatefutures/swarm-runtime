@@ -1,0 +1,71 @@
+[package]
+name = "af-swarm-state"
+version = "0.1.0"
+edition = "2021"
+description = "Durable state layer for the AF Swarm Runtime virtual actor model"
+license = "Apache-2.0"
+# Issue: alternatefutures/admin#134
+
+[dependencies]
+# Protobuf serialization — aligns with v3.0 §12 tech stack decision
+prost = "0.13"
+prost-types = "0.13"  # for google.protobuf.Timestamp
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# Dapr Rust SDK — Dapr state store client
+# See: https://github.com/dapr/rust-sdk
+# Coordination: senku (#130) owns Dapr state store selection (Redis vs PostgreSQL)
+dapr = { version = "0.14", optional = true }
+
+# FHE — for RESTRICTED-tier agent state encryption (v3.0 §5.4)
+# Build with GPU support: cargo build --features tfhe-cuda
+tfhe = { version = "0.7", features = ["integer", "shortint", "x86_64-unix"] }
+
+# AES-256-GCM for SENSITIVE-tier encryption
+aes-gcm = "0.10"
+
+# Random nonce generation for AES-GCM
+rand = "0.8"
+
+# LanceDB for embedding vector storage (v3.0 §4.3)
+# Note: lancedb-rs is the Rust binding for the embedded LanceDB
+lancedb = { version = "0.4", optional = true }
+
+# ULID generation for turn_id, log_id, fact_id, goal_id
+ulid = "1"
+
+# Timestamps
+chrono = { version = "0.4", features = ["serde"] }
+
+# SHA-256 for checkpoint integrity digests
+sha2 = "0.10"
+
+# Error handling
+thiserror = "1"
+anyhow = "1"
+
+# Tracing / observability (integrates with v3.0 §9 OpenTelemetry pipeline)
+tracing = "0.1"
+
+# Async trait support
+async-trait = "0.1"
+
+# Bytes buffer (for serialization boundaries)
+bytes = "1"
+
+[build-dependencies]
+prost-build = "0.13"
+
+[features]
+default = ["dapr-state", "lancedb-storage"]
+# Enable Dapr state store integration
+dapr-state = ["dapr"]
+# Enable LanceDB embedding storage
+lancedb-storage = ["lancedb"]
+# Enable CUDA-accelerated FHE operations (requires NVIDIA GPU + CUDA toolkit)
+tfhe-cuda = ["tfhe/cuda"]
+
+[dev-dependencies]
+tokio-test = "0.4"

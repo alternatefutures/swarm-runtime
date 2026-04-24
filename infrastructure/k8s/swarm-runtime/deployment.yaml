@@ -1,0 +1,143 @@
+# Swarm Runtime Deployment
+# Issue: alternatefutures/admin#130
+# Track: Infrastructure — Dapr deployment substrate
+#
+# One Deployment for the OPEN POOL (Tier C).
+# RESTRICTED POD is a separate deployment in swarm-runtime-restricted namespace.
+#
+# Dapr sidecar is injected via annotations (not declared inline).
+# Resource limits: dapr-deployment.md §2.2
+# Actor config: dapr-deployment.md §2.4
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: swarm-runtime
+  namespace: swarm-runtime
+  labels:
+    app: swarm-runtime
+    app.kubernetes.io/part-of: af-swarm-runtime
+    af/tier: "open-pool"
+spec:
+  # Replica count managed by KEDA ScaledObject (keda.yaml)
+  # Setting to 1 here as baseline; KEDA will override
+  replicas: 1
+  selector:
+    matchLabels:
+      app: swarm-runtime
+  template:
+    metadata:
+      labels:
+        app: swarm-runtime
+        af/tier: "open-pool"
+      annotations:
+        # Dapr sidecar injection
+        dapr.io/enabled: "true"
+        dapr.io/app-id: "swarm-runtime"
+        dapr.io/app-port: "8080"
+        dapr.io/config: "swarm-runtime-config"
+        dapr.io/log-level: "info"
+        dapr.io/metrics-port: "9090"
+        # Sidecar resource limits (dapr-deployment.md §2.2)
+        dapr.io/sidecar-cpu-request: "50m"
+        dapr.io/sidecar-memory-request: "64Mi"
+        dapr.io/sidecar-cpu-limit: "200m"
+        dapr.io/sidecar-memory-limit: "256Mi"
+        # Actor config (dapr-deployment.md §2.4)
+        dapr.io/actor-idle-timeout: "5m"        # Default; overridden per agent type at runtime
+        dapr.io/actor-scan-interval: "30s"
+        dapr.io/drain-ongoing-call-timeout: "30s"
+        dapr.io/drain-rebalanced-actors: "true"
+        # Prometheus scrape annotations (v3.0 Phase 9)
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8081"              # Rust runtime metrics (separate from Dapr :9090)
+        prometheus.io/path: "/metrics"
+    spec:
+      serviceAccountName: swarm-runtime
+      containers:
+        - name: swarm-runtime
+          # TODO: Replace with actual image once built (Phase 0 scaffolding)
+          image: 219282777226.dkr.ecr.us-east-1.amazonaws.com/swarm-runtime:latest
+          imagePullPolicy: Always
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+            - name: metrics
+              containerPort: 8081
+              protocol: TCP
+            - name: grpc
+              containerPort: 50051
+              protocol: TCP
+          env:
+            - name: RUST_LOG
+              value: "info,swarm_runtime=debug"
+            - name: DAPR_HTTP_PORT
+              value: "3500"
+            - name: DAPR_GRPC_PORT
+              value: "50001"
+            - name: AF_SWARM_STATE_STORE_HOT
+              value: "statestore-hot"
+            - name: AF_SWARM_STATE_STORE_COLD
+              value: "statestore-cold"
+            - name: AF_SWARM_PUBSUB
+              value: "pubsub-nats"
+            - name: AF_SWARM_DATA_TIER
+              value: "open-pool"    # Runtime reads this to enforce DSE routing
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: "http://opentelemetry-collector.observability.svc.cluster.local:4318"
+            - name: OTEL_SERVICE_NAME
+              value: "swarm-runtime"
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "512Mi"
+            limits:
+              cpu: "2000m"
+              memory: "2Gi"
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 30
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            failureThreshold: 3
+      # TODO: Add init container to wait for Dapr sidecar ready before Rust runtime starts
+      # This prevents the runtime from trying to call state APIs before daprd is up
+
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: swarm-runtime
+  namespace: swarm-runtime
+  labels:
+    app: swarm-runtime
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: swarm-runtime
+  namespace: swarm-runtime
+  labels:
+    app: swarm-runtime
+spec:
+  selector:
+    app: swarm-runtime
+  ports:
+    - name: http
+      port: 80
+      targetPort: 8080
+    - name: grpc
+      port: 50051
+      targetPort: 50051
+  type: ClusterIP

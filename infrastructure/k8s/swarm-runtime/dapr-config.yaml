@@ -1,0 +1,63 @@
+# Dapr Configuration for Swarm Runtime
+# Issue: alternatefutures/admin#130
+# Track: Infrastructure — Dapr deployment substrate
+#
+# References:
+#   - dapr-deployment.md §2.3 (TLS config)
+#   - dapr-deployment.md §2.4 (actor placement config)
+#   - RFC-001 §1.2 (Dapr as virtual actor substrate)
+
+---
+# Open Pool configuration (swarm-runtime namespace)
+apiVersion: dapr.io/v1alpha1
+kind: Configuration
+metadata:
+  name: swarm-runtime-config
+  namespace: swarm-runtime
+spec:
+  mtls:
+    enabled: true
+    workloadCertTTL: "24h"
+    allowedClockSkew: "15m"
+  tracing:
+    samplingRate: "1"  # 100% sampling; reduce to "0.1" under high load
+    otel:
+      endpointAddress: "opentelemetry-collector.observability.svc.cluster.local:4318"
+      isSecure: false
+      protocol: http
+  metric:
+    enabled: true
+  # TODO Phase 9 (observability): Wire Prometheus scrape annotations
+  features:
+    - name: ActorStateTTL
+      enabled: true   # Required for hot-tier Redis TTL support
+    - name: AppHealthCheck
+      enabled: true
+
+---
+# Restricted Pod configuration (swarm-runtime-restricted namespace)
+# Identical to open pool config but isolated namespace = separate SPIFFE trust domain
+apiVersion: dapr.io/v1alpha1
+kind: Configuration
+metadata:
+  name: swarm-runtime-restricted-config
+  namespace: swarm-runtime-restricted
+spec:
+  mtls:
+    enabled: true
+    workloadCertTTL: "12h"   # Shorter cert TTL for higher-security namespace
+    allowedClockSkew: "15m"
+  tracing:
+    samplingRate: "1"
+    otel:
+      endpointAddress: "opentelemetry-collector.observability.svc.cluster.local:4318"
+      isSecure: false
+      protocol: http
+  metric:
+    enabled: true
+  features:
+    - name: ActorStateTTL
+      enabled: true
+    - name: AppHealthCheck
+      enabled: true
+  # TODO argus (#133): Add access control configuration for restricted namespace

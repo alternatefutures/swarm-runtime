@@ -1,0 +1,69 @@
+syntax = "proto3";
+
+package af.inference.v1;
+
+option java_package = "ai.alternatefutures.inference.v1";
+option go_package = "github.com/alternatefutures/af-inference-client/v1";
+
+// ---------------------------------------------------------------------------
+// Shared enums and value types used across inference.proto and related services
+// ---------------------------------------------------------------------------
+
+// Data sensitivity classification — mirrors the Rust DSE (Data Sensitivity Engine)
+// defined in rust-swarm-runtime.md §DataSensitivityEngine.
+// IMPORTANT: values must remain stable (proto3 enum numbers are wire format).
+enum SensitivityLevel {
+  SENSITIVITY_LEVEL_UNSPECIFIED = 0;
+  SENSITIVITY_LEVEL_PUBLIC      = 1;
+  SENSITIVITY_LEVEL_INTERNAL    = 2;
+  SENSITIVITY_LEVEL_SENSITIVE   = 3;
+  SENSITIVITY_LEVEL_RESTRICTED  = 4;  // → RESTRICTED POD only (argus-managed)
+}
+
+// Identifies which model handled the request.
+enum ModelId {
+  MODEL_ID_UNSPECIFIED    = 0;
+  MODEL_ID_KIMI_K25       = 1;  // Moonshot Kimi K2.5 — primary orchestration model
+  MODEL_ID_QUEN_0_5B      = 2;  // Qwen2.5-0.5B — classification/routing tier
+  MODEL_ID_CLAUDE         = 3;  // Claude API — high-stakes, budget-gated
+  MODEL_ID_MISTRAL_RS     = 4;  // mistral.rs edge path — Tier C, no GPU (not cluster)
+}
+
+// Task category used for routing and cost attribution.
+enum TaskType {
+  TASK_TYPE_UNSPECIFIED   = 0;
+  TASK_TYPE_ORCHESTRATION = 1;  // multi-step planning, sub-agent dispatch
+  TASK_TYPE_TOOL_USE      = 2;  // single tool invocation
+  TASK_TYPE_CLASSIFICATION= 3;  // routing/classification — always → QuenClassifier
+  TASK_TYPE_GENERATION    = 4;  // text/code generation
+  TASK_TYPE_REASONING     = 5;  // structured reasoning / chain-of-thought
+  TASK_TYPE_RETRIEVAL     = 6;  // memory/RAG retrieval augmentation
+}
+
+// Hardware tier for the request — reflects RFC §Security inference pod tiering.
+enum HardwareTier {
+  HARDWARE_TIER_UNSPECIFIED = 0;
+  HARDWARE_TIER_A           = 1;  // Controlled/hyperscaler — RESTRICTED tasks only
+  HARDWARE_TIER_B           = 2;  // Audited DePIN (Phala)
+  HARDWARE_TIER_C           = 3;  // Community DePIN (Akash) — OPEN POOL
+}
+
+// Token usage counters returned with every response.
+message TokenUsage {
+  uint64 prompt_tokens     = 1;
+  uint64 completion_tokens = 2;
+  uint64 total_tokens      = 3;
+  // Estimated cost in USD (computed cluster-side from token counts × model rate).
+  // Advisory only — authoritative cost attribution lives in Prometheus (see design §9).
+  double estimated_cost_usd = 4;
+}
+
+// KV cache namespace key — identifies the cache partition for a request.
+// Wire format: "{tenant_id}:{sensitivity}:{agent_type}:{prefix_hash_hex}"
+// See design doc §5.2 for the isolation semantics.
+message KVNamespaceKey {
+  string tenant_id        = 1;
+  SensitivityLevel sensitivity = 2;
+  string agent_type       = 3;
+  bytes  prefix_hash      = 4;  // SHA-256 of system prompt prefix (32 bytes)
+}

@@ -1,0 +1,112 @@
+// crates/af-swarm-state/proto/working_memory.proto
+// Working memory snapshot — MemAgent O(1) context window (v3.0 §4.3).
+//
+// Key format: {tenant_id}||{agent_id}||working_memory
+// Design: docs/architecture/design/state-schema.md §3.4, §5
+// Issue: alternatefutures/admin#134
+//
+// Size budget: ≤256 KB (32 slots × max 4KB content + scratchpad).
+// Stored separately from AgentStateRecord to avoid bloating the hot
+// hydration path. Lazy-loaded after primary state is confirmed consistent.
+
+syntax = "proto3";
+
+package af.swarm.state;
+
+import "google/protobuf/timestamp.proto";
+import "common.proto";
+import "encryption.proto";
+
+option go_package = "github.com/alternatefutures/swarm/state;state";
+
+// ────────────────────────────────────────────────────────────────────────────
+// WorkingMemoryRecord
+// ────────────────────────────────────────────────────────────────────────────
+message WorkingMemoryRecord {
+  // ── Identity ──────────────────────────────────────────────────────────────
+  string tenant_id = 1;
+  string agent_id = 2;
+  // Monotonic version counter. Must match AgentStateRecord.working_memory_version.
+  // A mismatch on hydration indicates a torn write → checkpoint recovery.
+  uint64 version = 3;
+
+  // ── Fixed-capacity context window (MemAgent O(1) model) ───────────────────
+  // Maximum 32 slots. Slot allocation by range:
+  //   [0–3]   Pinned: agent identity, current task, pinned facts replica
+  //   [4–7]   Pinned while goal IN_PROGRESS: active goal frames
+  //   [8–23]  LRU-eligible: recent conversation context
+  //   [24–31] LRU + low-relevance-first: tool outputs and SYNAPSE retrievals
+  repeated MemorySlot slots = 4;
+
+  // LRU eviction pointer (index into slots, wraps at 32).
+  // Points to the next candidate for eviction in the LRU-eligible range [8–31].
+  uint32 eviction_cursor = 5;
+
+  // ── Scratchpad (ephemeral, cleared on task completion) ────────────────────
+  // Serialized list of ScratchpadEntry messages (not a repeated field because
+  // the entire scratchpad is treated as a single opaque blob for atomic clear).
+  // Max size: 64 KB. Encrypted per encryption field below when applicable.
+  bytes scratchpad_bytes = 6;
+
+  // ── Active goal IDs (denormalized for quick access) ───────────────────────
+  // Subset of AgentStateRecord.goal_stack where status == IN_PROGRESS or PENDING.
+  // Read-only during task execution; authoritative source is AgentStateRecord.
+  repeated string active_goal_ids = 7;
+
+  google.protobuf.Timestamp snapshot_at = 8;
+
+  // ── Encryption ────────────────────────────────────────────────────────────
+  EncryptionEnvelope encryption = 9;
+
+  uint32 schema_version = 10;
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// MemorySlot
+// ────────────────────────────────────────────────────────────────────────────
+message MemorySlot {
+  // Slot index 0–31.
+  uint32 slot_index = 1;
+
+  // Text content for this slot. Max 4KB.
+  // May be a conversation excerpt, tool output summary, or retrieved memory.
+  string content = 2;
+
+  // Relevance score [0.0, 1.0], updated by MemAgent on each access.
+  // Higher score → less likely to be evicted when LRU candidates are equal.
+  float relevance_score = 3;
+
+  google.protobuf.Timestamp last_accessed_at = 4;
+
+  // Pinned slots are exempt from LRU eviction.
+  // Slots 0–3 are always pinned. Slots 4–7 are pinned while their goal is active.
+  // Slots 8–31 can be manually pinned by the agent (via scratchpad instruction),
+  // but doing so reduces the effective LRU window.
+  bool is_pinned = 5;
+
+  // Provenance: which ConversationTurnRecord or ToolCallLogRecord produced this.
+  // Empty for manually-set slots.
+  string source_id = 6;
+
+  // DSE data class for taint propagation. When this slot's content is promoted
+  // to a new context window, the taint is propagated to the new TaintContext.
+  DataClass data_class = 7;
+
+  // NOTE: LanceDB embedding vector for this slot is stored in LanceDB,
+  // referenced via AgentStateRecord.lancedb_record_ids. It is NOT stored here.
+  // This avoids bloating working memory with 1.5KB vectors per slot (384 × 4B).
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// ScratchpadEntry (embedded in WorkingMemoryRecord.scratchpad_bytes)
+// ────────────────────────────────────────────────────────────────────────────
+// The scratchpad is serialized as a repeated ScratchpadEntry list, encoded to
+// bytes and stored in scratchpad_bytes (enables atomic clear-on-task-completion
+// by writing an empty bytes value without affecting other fields).
+message ScratchpadEntry {
+  string key = 1;    // Max 256 bytes
+  string value = 2;  // Max 8KB per entry
+  google.protobuf.Timestamp written_at = 3;
+  // DSE data class of this scratchpad value.
+  DataClass data_class = 4;
+}
